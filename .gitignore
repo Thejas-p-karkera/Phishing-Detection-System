@@ -1,0 +1,49 @@
+# ============================================================
+# ROOT .gitignore  —  D:\advanced-phishing-webapp\
+# Controls the entire project from the top level
+# ============================================================
+
+# ── Python (backend) ─────────────────────────────────────────
+backend/venv/
+backend/__pycache__/
+backend/*.pyc
+backend/*.pyo
+backend/*.pyd
+
+# API keys — NEVER upload these
+backend/.env
+
+# Large ML files — too big for GitHub (store on Google Drive / USB)
+backend/1LModel.joblib
+backend/1LExtracted.csv
+
+# Python cache in any subfolder
+**/__pycache__/
+**/*.pyc
+
+# ── Node / React (frontend) ──────────────────────────────────
+frontend/node_modules/
+frontend/build/
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/.pnp
+frontend/.pnp.js
+frontend/coverage/
+
+# ── Browser Extension ────────────────────────────────────────
+# No large or sensitive files in the extension folder.
+# Nothing to ignore here.
+
+# ── OS generated files ───────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── VS Code workspace settings (optional — remove if you want
+#    to share VS Code settings with teammates) ─────────────────
+.vscode/
