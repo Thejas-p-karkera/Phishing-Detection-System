@@ -52,7 +52,7 @@ The system was benchmarked against **PhiUSIIL (504,933 labelled URLs)** for trai
 ## 🖥️ Screenshots
 
 <table>
-<tr>
+<tr valign="top">
 <td width="33%" align="center"><b>Legitimate site</b><br><img src="assets/popup-legitimate.png" /></td>
 <td width="33%" align="center"><b>Suspicious / Uncertain</b><br><img src="assets/overlay-suspicious.png" /></td>
 <td width="33%" align="center"><b>Phishing detected</b><br><img src="assets/overlay-phishing.png" /></td>
