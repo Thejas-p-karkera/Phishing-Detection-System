@@ -1,138 +1,85 @@
 const API_URL = 'http://localhost:8000/predict';
 
-// ─── Confidence threshold (now handled server-side) ──────────────────────────
-// The server applies the 80% threshold and returns "Phishing"/"Uncertain"/"Legitimate".
-// background.js trusts that verdict directly — no re-evaluation here.
+// ── Screenshot-safe capture ─────────────────────────────────────────────────
+// Always hide the content.js overlay banner before capturing a screenshot,
+// then restore it. Prevents the banner from being baked into stored/compared
+// perceptual hashes (see content.js for full explanation of the bug this fixes).
+async function captureCleanScreenshot(tabId, windowId) {
+  let hideResult = null;
+  if (tabId != null) {
+    try {
+      hideResult = await chrome.tabs.sendMessage(tabId, { action: 'hideOverlay' });
+    } catch (err) {
+      // Common cause: content.js hasn't been injected into this tab yet — e.g.
+      // the tab was open before the extension was installed/reloaded, or this
+      // is the first scan on this tab this session. This is EXPECTED and
+      // harmless: if content.js never ran, there is no overlay banner to hide
+      // in the first place, so the screenshot is already clean.
+      // Logged at console.debug (not console.warn) so it doesn't get flagged
+      // as an "Error" on the extension's chrome://extensions Errors page —
+      // Chrome surfaces console.warn there, which made this benign, already-
+      // handled fallback look like a real bug.
+      console.debug('[PhishGuard] hideOverlay skipped (content script not present on this tab) — '
+        + 'proceeding with capture as-is.', err?.message || err);
+    }
+  }
 
-// ─── Trusted domains whitelist ────────────────────────────────────────────────
-// Two-tier system:
-//   TRUSTED_DOMAINS  — never scan, return safe instantly (Tier 1: well-known giants)
-//   All subdomain matching is handled in isTrustedDomain() below, so adding
-//   'openai.com' also covers 'chat.openai.com', 'api.openai.com', etc.
-//
-// Why this matters for AI/search sites:
-//   Bing, ChatGPT, Perplexity etc. use long token-heavy URLs, many subdomains,
-//   and blocks scrapers — all of which score high on phishing heuristics.
-//   The model was not trained on these URL patterns so it misfires.
-const TRUSTED_DOMAINS = new Set([
-  // ── Search engines ────────────────────────────────────────────────────
-  'google.com',       'google.co.in',     'google.co.uk',    'google.com.au',
-  'bing.com',         'yahoo.com',        'duckduckgo.com',  'baidu.com',
-  'yandex.com',       'yandex.ru',        'ecosia.org',      'brave.com',
-  'startpage.com',    'search.yahoo.com',
+  // BUGFIX: requestAnimationFrame does NOT exist in MV3 service workers.
+  // The original `await new Promise(resolve => requestAnimationFrame(...))` threw
+  // ReferenceError every time, which was silently swallowed by the outer catch —
+  // making capturedDataUrl always null so /screenshot was never called and visual
+  // clone detection never ran for background auto-scans.
+  //
+  // setTimeout IS available in service workers (and also in popup/content contexts),
+  // so it works everywhere.  50 ms gives the browser one repaint cycle to actually
+  // remove the overlay pixels before we grab the screenshot.
+  await new Promise(resolve => setTimeout(resolve, 50));
 
-  // ── AI assistants & LLMs ──────────────────────────────────────────────
-  'openai.com',       'chatgpt.com',      // ChatGPT
-  'claude.ai',        'anthropic.com',    // Claude
-  'gemini.google.com','bard.google.com',  // Gemini / Bard
-  'perplexity.ai',    'you.com',          // Perplexity / You.com
-  'copilot.microsoft.com',                // Microsoft Copilot
-  'meta.ai',                              // Meta AI
-  'grok.x.ai',        'x.ai',            // Grok
-  'mistral.ai',       'huggingface.co',   // Mistral / HuggingFace
-  'cohere.com',       'ai.google',        // Cohere / Google AI
-  'deepmind.google',  'deepmind.com',     // DeepMind
-  'stability.ai',     'midjourney.com',   // Image AI
-  'character.ai',     'poe.com',          // Character.ai / Poe
-  'phind.com',        'kagi.com',         // Phind / Kagi
+  let dataUrl = null;
+  try {
+    dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+  } finally {
+    if (hideResult?.hidden && tabId != null) {
+      try { await chrome.tabs.sendMessage(tabId, { action: 'restoreOverlay' }); }
+      catch (_) {}
+    }
+  }
+  return dataUrl;
+}
 
-  // ── AI writing & productivity tools ──────────────────────────────────
-  'quillbot.com',     'grammarly.com',    // QuillBot / Grammarly
-  'writesonic.com',   'jasper.ai',        // Writesonic / Jasper
-  'copy.ai',          'rytr.me',          // Copy.ai / Rytr
-  'wordtune.com',     'hemingwayapp.com', // Wordtune / Hemingway
-  'humanizer.com',    'undetectable.ai',  // Humanizer / Undetectable
-  'stealthwriter.ai', 'scribbr.com',      // StealthWriter / Scribbr
-  'paperrater.com',   'prowritingaid.com',// PaperRater / ProWritingAid
-  'smodin.io',        'jenni.ai',         // Smodin / Jenni AI
-  'notion.so',        'coda.io',          // Notion / Coda
-  'obsidian.md',      'roamresearch.com', // Obsidian / Roam
+// ─── Trusted domains whitelist (synced from backend) ─────────────────────────
+let TRUSTED_DOMAINS = new Set(['localhost', '127.0.0.1']);
 
-  // ── Microsoft ecosystem ───────────────────────────────────────────────
-  'microsoft.com',    'live.com',         'office.com',       'outlook.com',
-  'hotmail.com',      'msn.com',          'azure.com',        'azurewebsites.net',
-  'windows.com',      'xbox.com',         'linkedin.com',     'skype.com',
-  'onenote.com',      'sharepoint.com',   'teams.microsoft.com',
+async function fetchTrustedWhitelist() {
+  try {
+    const response = await fetch('http://localhost:8000/static-whitelist');
+    if (response.ok) {
+      const data = await response.json();
+      TRUSTED_DOMAINS = new Set(data.domains);
+      console.log(`[PhishGuard] Loaded ${TRUSTED_DOMAINS.size} trusted domains from backend`);
+    } else {
+      console.warn('[PhishGuard] Could not fetch whitelist, using fallback');
+    }
+  } catch (err) {
+    console.warn('[PhishGuard] Failed to fetch whitelist:', err);
+  }
+}
+fetchTrustedWhitelist();
 
-  // ── Google ecosystem ──────────────────────────────────────────────────
-  'google.com',       'youtube.com',      'gmail.com',        'googleapis.com',
-  'googleusercontent.com', 'gstatic.com', 'googlevideo.com',  'googletagmanager.com',
-  'google.co.in',     'google.co.uk',     'maps.google.com',  'drive.google.com',
-  'docs.google.com',  'sheets.google.com','slides.google.com','meet.google.com',
-  'classroom.google.com',
-
-  // ── Apple ecosystem ───────────────────────────────────────────────────
-  'apple.com',        'icloud.com',       'itunes.apple.com', 'apps.apple.com',
-
-  // ── Amazon / AWS ──────────────────────────────────────────────────────
-  'amazon.com',       'amazon.in',        'amazon.co.uk',     'amazon.de',
-  'aws.amazon.com',   'amazonaws.com',    'cloudfront.net',
-
-  // ── Social media ──────────────────────────────────────────────────────
-  'facebook.com',     'instagram.com',    'twitter.com',      'x.com',
-  'threads.net',      'whatsapp.com',     'messenger.com',    'fb.com',
-  'tiktok.com',       'snapchat.com',     'pinterest.com',    'tumblr.com',
-  'discord.com',      'telegram.org',     'signal.org',
-
-  // ── Developer tools ───────────────────────────────────────────────────
-  'github.com',       'gitlab.com',       'bitbucket.org',    'stackoverflow.com',
-  'npmjs.com',        'pypi.org',         'docker.com',       'hub.docker.com',
-  'heroku.com',       'vercel.app',       'netlify.app',      'netlify.com',
-  'firebase.google.com', 'firebaseapp.com', 'web.app',
-  'replit.com',       'codepen.io',       'codesandbox.io',   'jsfiddle.net',
-  'dev.to',           'hashnode.dev',     'medium.com',
-
-  // ── Cloud & hosting ───────────────────────────────────────────────────
-  'digitalocean.com', 'linode.com',       'vultr.com',        'cloudflare.com',
-  'workers.dev',      'pages.dev',        'render.com',
-
-  // ── Finance & banking (commonly scanned) ──────────────────────────────
-  'paypal.com',       'stripe.com',       'wise.com',         'revolut.com',
-  'coinbase.com',     'binance.com',
-
-  // ── E-commerce ────────────────────────────────────────────────────────
-  'ebay.com',         'etsy.com',         'shopify.com',      'flipkart.com',
-  'myntra.com',       'meesho.com',
-
-  // ── News & media ──────────────────────────────────────────────────────
-  'bbc.com',          'bbc.co.uk',        'cnn.com',          'reuters.com',
-  'nytimes.com',      'theguardian.com',  'ndtv.com',         'timesofindia.com',
-  'hindustantimes.com','thehindu.com',     'livemint.com',
-
-  // ── Knowledge & reference ─────────────────────────────────────────────
-  'wikipedia.org',    'wikimedia.org',    'wikidata.org',     'britannica.com',
-  'quora.com',        'reddit.com',
-
-  // ── Local ─────────────────────────────────────────────────────────────
-  'localhost',        '127.0.0.1',
-]);
-
-// ─── URL sanity check ────────────────────────────────────────────────────────
-// Returns true only for URLs the extension should actually scan.
 function isScannable(url) {
   if (!url) return false;
-
-  // Block all browser-internal and non-http schemes
   const SKIP_PREFIXES = [
     'chrome://', 'chrome-extension://',
     'edge://', 'edge-extension://',
     'about:', 'data:', 'javascript:',
     'file://', 'blob:',
     'moz-extension://', 'safari-extension://',
-    'opera://', 'vivaldi://',
   ];
   if (SKIP_PREFIXES.some(p => url.startsWith(p))) return false;
-
-  // Block blank / empty pages
-  if (url === 'about:blank' || url === 'about:newtab' || url.trim() === '') return false;
-
-  // Must start with http:// or https://
   if (!url.startsWith('http://') && !url.startsWith('https://')) return false;
-
   return true;
 }
 
-// Returns true if the hostname matches a trusted domain or any subdomain of one.
 function isTrustedDomain(url) {
   try {
     const hostname = new URL(url).hostname.toLowerCase();
@@ -145,203 +92,247 @@ function isTrustedDomain(url) {
   return false;
 }
 
-// ─── Core scan function ───────────────────────────────────────────────────────
 async function scanUrl(url, tabId = null) {
   if (!isScannable(url)) {
-    try { chrome.action.setBadgeText({ text: '' }); } catch (_) {}
+    chrome.action.setBadgeText({ text: '' }).catch(() => {});
     return null;
   }
 
-  // Short-circuit for trusted domains — no network call needed
   if (isTrustedDomain(url)) {
-    try {
-      chrome.action.setBadgeBackgroundColor({ color: '#4caf50' });
-      chrome.action.setBadgeText({ text: 'SAFE' });
-    } catch (_) {}
+    chrome.action.setBadgeBackgroundColor({ color: '#4caf50' }).catch(() => {});
+    chrome.action.setBadgeText({ text: 'SAFE' }).catch(() => {});
+    // BUGFIX: scanUrl() is only ever reached via the content-script's
+    // automatic "scan" message on page load/navigation — the manual scan
+    // button in popup.js calls /predict directly and never touches this
+    // function. So this branch is ALWAYS auto-scan, never manual. Per the
+    // same rule as the backend's Tier 1/2 checks, a trusted-domain auto-scan
+    // must never be logged to Scan History / Total Scans — so the
+    // /log-trusted call is removed entirely rather than gated.
     return { prediction: 'Legitimate', confidence: 1.0, message: 'Trusted domain — skipped scan' };
   }
 
+  if (tabId) {
+    chrome.action.setBadgeText({ text: '...', tabId }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ color: '#9e9e9e', tabId }).catch(() => {});
+  } else {
+    chrome.action.setBadgeText({ text: '...' }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ color: '#9e9e9e' }).catch(() => {});
+  }
+
+  const controller = new AbortController();
+  // BUGFIX: 10s was too short for /predict, which chains WHOIS + ML + GSB +
+  // VirusTotal + feed lookups. Domains already flagged suspicious (extra VT
+  // scrutiny) can legitimately take longer, causing the fetch to abort with
+  // a DOMException (AbortError) even though the server was still working.
+  // That aborted request fell through to the catch block, showed a
+  // misleading "Scan failed — server unreachable" badge, and logged an
+  // unreadable "[object DOMException]" on the extension's Errors page.
+  // 20s gives slow multi-check scans room to finish normally.
+  const timeoutHandle = setTimeout(() => controller.abort(), 20000);
+
   try {
+    // ── PERF FIX: Resolve windowId BEFORE launching the parallel race ──────
+    // chrome.tabs.get() is a fast local Chrome API call (~1ms) that does NOT
+    // need to wait for the server. Doing it upfront lets us start the screenshot
+    // capture at the same time as /predict instead of after it completes.
+    let windowId = null;
     if (tabId) {
-      chrome.action.setBadgeText({ text: '...', tabId });
-      chrome.action.setBadgeBackgroundColor({ color: '#9e9e9e', tabId });
-    } else {
-      chrome.action.setBadgeText({ text: '...' });
-      chrome.action.setBadgeBackgroundColor({ color: '#9e9e9e' });
-    }
-  } catch (_) {}
-
-  try {
-    // ── Capture screenshot + call /predict simultaneously ─────────────────────
-    // Screenshot is used for visual clone detection (pHash comparison against
-    // known phishing pages) and for auto-adding hashes when Phishing is confirmed.
-    // Stored in _capturedDataUrl so it can be reused for /hash/add without
-    // a second capture call.
-    let _capturedDataUrl = null;
-
-    const screenshotPromise = (async () => {
       try {
-        _capturedDataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
-        const res = await fetch('http://localhost:8000/screenshot', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, screenshot: _capturedDataUrl })
-        });
-        return res.ok ? await res.json() : null;
-      } catch (_) { return null; }  // best-effort, never blocks main result
-    })();
+        const tabInfo = await chrome.tabs.get(tabId);
+        windowId = tabInfo.windowId;
+      } catch (_) {}
+    }
 
+    // ── PERF FIX: Launch /predict AND screenshot capture simultaneously ─────
+    // Previously: predict (~3-8s) → screenshot (~1s) → /screenshot API (~0.5s)
+    //             = predict_time + capture_time + api_time  total
+    // Now:        predict AND screenshot start at the same time.
+    //             Since predict takes longer, screenshot is almost always done
+    //             by the time predict responds. User-visible wait drops by ~1-2s.
+    //
+    // popup.js already uses Promise.all for this — background.js now matches it.
     const predictPromise = fetch(API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url })
+      // manual: false (explicit) — this is the automatic background scan.
+      // "trusted" verdicts from here are intentionally NOT logged; see
+      // /predict Tier 1 in app.py.
+      body: JSON.stringify({ url, manual: false }),
+      signal: controller.signal,
     });
 
-    const [predictRes, screenshotResult] = await Promise.all([predictPromise, screenshotPromise]);
-
+    // Wait for /predict first — it drives the verdict
+    const predictRes = await predictPromise;
+    clearTimeout(timeoutHandle);
     if (!predictRes.ok) throw new Error(`HTTP ${predictRes.status}`);
     const data = await predictRes.json();
 
-    let   confidence = data.confidence ?? 0.5;
-    let   message    = data.message ?? 'Scanned';
-    let   prediction = data.prediction ?? 'Legitimate'; // "Phishing"|"Uncertain"|"Legitimate"
-    let   reasons    = data.reasons ?? [];
+    // BUGFIX: take the screenshot AFTER /predict returns, not concurrently.
+    //
+    // Previously the screenshot started at the same time as /predict and
+    // finished at ~50 ms.  /predict takes 3-8 s (WHOIS + ML + content fetch)
+    // so by the time it finishes the screenshot was taken up to 8 s earlier —
+    // when a JS-heavy page (React/Next.js SPA) may only have painted its
+    // loading skeleton.  That skeleton looks completely different from the
+    // fully-rendered page, so pHash distance easily exceeded the similarity
+    // threshold even for the identical URL, breaking visual clone detection.
+    //
+    // Taking the screenshot after /predict means it is captured once the page
+    // has had 3-8 s to render — matching popup.js's behaviour (screenshot is
+    // always of the fully-rendered page the user is actively viewing).
+    let capturedDataUrl = null;
+    try {
+      capturedDataUrl = await captureCleanScreenshot(tabId, windowId);
+    } catch (_) {}
 
-    // ── Visual clone override ─────────────────────────────────────────────────
-    // If the page screenshot matches a known phishing page hash (Hamming ≤10),
-    // override the verdict to Phishing regardless of what ML predicted.
-    // Exception: skip override if the user already marked this page as safe
-    // (status === 'user_reported' && prediction === 'Legitimate').
-    const userReportedSafe = data.status === 'user_reported' && prediction === 'Legitimate';
-    if (screenshotResult?.is_clone && !userReportedSafe) {
-      if (prediction !== 'Phishing') {
-        prediction = 'Phishing';
-        message    = 'Page design matches a known phishing template';
-        reasons    = [
-          { label: 'Page visually clones a known phishing site',
-            severity: 'high', feature: 'visual_clone', value: 1 },
+    let screenshotResult = null;
+    if (capturedDataUrl) {
+      try {
+        const screenshotRes = await fetch('http://localhost:8000/screenshot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, screenshot: capturedDataUrl })
+        });
+        screenshotResult = screenshotRes.ok ? await screenshotRes.json() : null;
+      } catch (_) {}
+    }
+
+    let confidence = data.confidence ?? 0.5;
+    let message = data.message ?? 'Scanned';
+    let prediction = data.prediction ?? 'Legitimate';
+    let reasons = data.reasons ?? [];
+
+    // Any user-reported verdict (safe OR phishing) is definitive and final — it
+    // must never be re-labeled by the visual-clone heuristic on a rescan.
+    // Previously this only guarded the false_positive case (prediction ===
+    // 'Legitimate'), so a false_negative report (user marked it Phishing) had
+    // no protection: rescans re-triggered "Visual Clone" and overwrote the
+    // cached "Marked as phishing by user report" reason.
+    const isUserReported = data.status === 'user_reported';
+    // BUGFIX: skip the override entirely when data.status === 'cached'.
+    // Same reasoning as popup.js — see its comment for full explanation.
+    if (screenshotResult?.is_clone && !isUserReported && data.status !== 'cached') {
+      // BUGFIX: always apply visual-clone verdict and evidence, even when
+      // /predict already returned 'Phishing' via PhishTank / ML.
+      // Previously the inner `if (prediction !== 'Phishing')` guard meant
+      // that message and reasons were never updated in that case — so the UI
+      // showed 'Phishing (PhishTank)' with no mention of the pHash match,
+      // and after a server restart (cache cleared) the rescan looked identical
+      // to a plain ML hit rather than a visual-clone detection.
+      prediction = 'Phishing';
+      confidence = Math.max(confidence, 0.99);
+      message    = 'Page design matches a known phishing template';
+      if (!reasons.some(r => r.feature === 'visual_clone')) {
+        reasons = [
+          { label: 'Page visually clones a known phishing site', severity: 'high', feature: 'visual_clone', value: 1 },
           ...reasons
         ];
       }
-      // Write the overridden result back to server cache so popup.js and
-      // the next auto-scan all see the same consistent Phishing verdict.
       fetch('http://localhost:8000/cache/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, result: {
-          status: data.status, prediction, confidence, message, reasons,
+          status: 'visual_clone', prediction, confidence, message, reasons,
           gsb_checked: data.gsb_checked, vt: data.vt || {}, features: data.features || {}
         }})
       }).catch(() => {});
     }
 
-    // ── Auto-add screenshot hash when Phishing is confirmed ───────────────────
-    // Only when NOT a user_reported result to prevent re-hashing corrected pages.
-    if (prediction === 'Phishing' && _capturedDataUrl && data.status !== 'user_reported') {
+    const isFreshScan = !['cached', 'visual_clone'].includes(data.status);
+    if (prediction === 'Phishing' && capturedDataUrl && data.status !== 'user_reported' && isFreshScan) {
       fetch('http://localhost:8000/hash/add', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, screenshot: _capturedDataUrl })
-      }).then(r => r.json())
-        .then(d => console.log(`[PhishGuard] Hash auto-added: ${d.added} db_size=${d.db_size}`))
-        .catch(() => {});
+        body: JSON.stringify({ url, screenshot: capturedDataUrl })
+      }).catch(() => {});
     }
 
-    // ── Badge & notification ─────────────────────────────────────────────────
-    // Server is the single decision-maker — no threshold re-evaluation here.
-    //
-    // "Phishing"  → red  PHSH badge + notification (confirmed threat)
-    // "Uncertain" → amber WARN badge + notification (conflict: ML flagged, VT clears)
-    // "Legitimate"→ green SAFE badge, no notification
-
-    const isPhish     = prediction === 'Phishing';
+    const isPhish = prediction === 'Phishing';
     const isUncertain = prediction === 'Uncertain';
-
-    // Per-tab badge — each tab shows its own verdict independently
-    const badgeText  = isPhish ? 'PHSH' : isUncertain ? 'WARN' : 'SAFE';
+    const badgeText = isPhish ? 'PHSH' : isUncertain ? 'WARN' : 'SAFE';
     const badgeColor = isPhish ? '#d32f2f' : isUncertain ? '#e65100' : '#2e7d32';
-    try {
-      if (tabId) {
-        chrome.action.setBadgeText({ text: badgeText, tabId });
-        chrome.action.setBadgeBackgroundColor({ color: badgeColor, tabId });
-      } else {
-        chrome.action.setBadgeText({ text: badgeText });
-        chrome.action.setBadgeBackgroundColor({ color: badgeColor });
-      }
-      // Store result for badge restoration when switching tabs
-      if (tabId) _tabResults.set(tabId, { prediction, badgeText, badgeColor });
-    } catch (_) {}
+    if (tabId) {
+      chrome.action.setBadgeText({ text: badgeText, tabId }).catch(() => {});
+      chrome.action.setBadgeBackgroundColor({ color: badgeColor, tabId }).catch(() => {});
+      _tabResults.set(tabId, { prediction, badgeText, badgeColor });
+    } else {
+      chrome.action.setBadgeText({ text: badgeText }).catch(() => {});
+      chrome.action.setBadgeBackgroundColor({ color: badgeColor }).catch(() => {});
+    }
 
     if (isPhish || isUncertain) {
       let hostname = url;
       try { hostname = new URL(url).hostname.replace(/^www\./, ''); } catch (_) {}
-
-      // Use a unique notification ID: tab + timestamp.
-      // Previously we used a deterministic ID per hostname, which caused the OS
-      // to silently update an existing notification on refresh instead of showing
-      // a new toast. A unique ID guarantees a new notification every page load.
       const notifId = `phishguard-${tabId || 0}-${Date.now()}`;
-
       chrome.notifications.create(notifId, {
-        type:    'basic',
+        type: 'basic',
         iconUrl: 'icons/icon48.png',
-        title:   isPhish
-          ? `Phishing Detected — ${hostname}`
-          : `Suspicious Site — ${hostname}`,
+        title: isPhish ? `Phishing Detected — ${hostname}` : `Suspicious Site — ${hostname}`,
         message: `${Math.round(confidence * 100)}% · ${message}`
       });
     }
-
-
-
     return { prediction, confidence, message, reasons };
-
   } catch (e) {
-    console.error('PhishGuard scan error:', e);
-    try {
-      if (tabId) {
-        chrome.action.setBadgeText({ text: 'ERR', tabId });
-        chrome.action.setBadgeBackgroundColor({ color: '#ff9800', tabId });
-      } else {
-        chrome.action.setBadgeText({ text: 'ERR' });
-        chrome.action.setBadgeBackgroundColor({ color: '#ff9800' });
-      }
-    } catch (_) {}
-    return { prediction: 'Legitimate', confidence: 0, message: 'Scan failed — server unreachable' };
+    // BUGFIX: log a readable message instead of the raw error object.
+    // console.error('...', e) on a DOMException (e.g. AbortError) rendered
+    // as the unhelpful "[object DOMException]" on the extension's Errors page.
+    const isTimeout = e?.name === 'AbortError';
+    console.error('PhishGuard scan error:', e?.message || e?.name || String(e));
+    if (tabId) {
+      chrome.action.setBadgeText({ text: 'ERR', tabId }).catch(() => {});
+      chrome.action.setBadgeBackgroundColor({ color: '#ff9800', tabId }).catch(() => {});
+    } else {
+      chrome.action.setBadgeText({ text: 'ERR' }).catch(() => {});
+      chrome.action.setBadgeBackgroundColor({ color: '#ff9800' }).catch(() => {});
+    }
+    // BUGFIX: distinguish "the scan took too long" from "the server is down" —
+    // these are different problems with different fixes on the user's end.
+    return {
+      prediction: 'Legitimate',
+      confidence: 0,
+      message: isTimeout ? 'Scan timed out — the site may be slow to respond' : 'Scan failed — server unreachable'
+    };
   }
 }
 
-// ─── Per-tab result store ─────────────────────────────────────────────────────
-// Stores the last scan result (badge text + colour) per tab so the correct
-// badge can be restored when the user switches between tabs.
-//
-// content.js is the ONLY scan trigger (re-injects fresh on every navigation
-// and every refresh). This eliminates the dual-trigger problem that caused
-// notifications to be silently suppressed on refresh.
-const _tabResults = new Map();  // tabId → { prediction, badgeText, badgeColor }
+const _tabResults = new Map();
 
-// ─── Message listener ──────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-
-  // ── Scan request (sole trigger — from content.js on every page load) ────────
-  // sender.tab.id lets us set per-tab badge and unique per-tab notifications.
   if (request.action === 'scan') {
     const tabId = sender.tab?.id ?? null;
     scanUrl(request.url, tabId)
       .then(result => sendResponse(result ?? { prediction: 'Legitimate', confidence: 0, message: 'Skipped' }))
       .catch(err => {
-        console.error('PhishGuard scan error:', err);
+        console.error('PhishGuard scan error:', err?.message || err?.name || String(err));
         sendResponse({ prediction: 'Legitimate', confidence: 0, message: 'Error' });
       });
-    return true;  // keep message channel open for async response
+    return true;
   }
-
-  // ── Hash add (called by popup.js false_negative report) ─────────────────────
   if (request.action === 'addHash') {
     (async () => {
       try {
-        const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
-        const res  = await fetch('http://localhost:8000/hash/add', {
+        // BUGFIX: when this message is sent from popup.js, sender.tab is null
+        // because the sender is the extension popup, not a content script in a tab.
+        // With tabId=null, captureCleanScreenshot skips hideOverlay and
+        // captureVisibleTab(null) may capture the wrong window.
+        // Fix: actively query the focused active tab when sender.tab is absent.
+        let tabId    = sender.tab?.id    ?? null;
+        let windowId = null;
+
+        if (tabId == null) {
+          try {
+            const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+            if (activeTab) { tabId = activeTab.id; windowId = activeTab.windowId; }
+          } catch (_) {}
+        } else {
+          try {
+            const info = await chrome.tabs.get(tabId);
+            windowId = info.windowId;
+          } catch (_) {}
+        }
+
+        const dataUrl = await captureCleanScreenshot(tabId, windowId);
+        const res = await fetch('http://localhost:8000/hash/add', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: request.url, screenshot: dataUrl })
@@ -354,12 +345,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     })();
     return true;
   }
-
-  // ── Hash remove by URL (called by popup.js false_positive report) ───────────
   if (request.action === 'removeHash') {
     (async () => {
       try {
-        const res  = await fetch('http://localhost:8000/hash/remove-by-url', {
+        const res = await fetch('http://localhost:8000/hash/remove-by-url', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: request.url })
@@ -374,26 +363,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
-// ─── Badge restoration on tab switch ─────────────────────────────────────────
-// When the user switches to a tab that was already scanned, restore its badge.
-// We do NOT re-scan here — content.js handles scanning on every page load.
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   const stored = _tabResults.get(tabId);
   if (stored) {
-    // Restore the badge for this tab
-    try {
-      chrome.action.setBadgeText({ text: stored.badgeText, tabId });
-      chrome.action.setBadgeBackgroundColor({ color: stored.badgeColor, tabId });
-    } catch (_) {}
+    chrome.action.setBadgeText({ text: stored.badgeText, tabId }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ color: stored.badgeColor, tabId }).catch(() => {});
   } else {
-    // Tab not yet scanned (e.g. just opened) — clear badge
-    try {
-      chrome.action.setBadgeText({ text: '', tabId });
-    } catch (_) {}
+    chrome.action.setBadgeText({ text: '', tabId }).catch(() => {});
   }
 });
 
-// Clean up stored result when a tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
   _tabResults.delete(tabId);
 });

@@ -1,356 +1,858 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import './App.css';
 
-const API_URL    = 'http://localhost:8000/predict';
-const REPORT_URL = 'http://localhost:8000/report';
-
-const SEVERITY_ICON = { high: '🔴', medium: '🟡', low: '🔵' };
-
-function verdictClass(p) {
-  if (p === 'Phishing')  return 'phish';
-  if (p === 'Uncertain') return 'uncertain';
-  return 'safe';
-}
-function verdictIcon(p) {
-  if (p === 'Phishing')  return '🚨';
-  if (p === 'Uncertain') return '⚠️';
-  return '✅';
-}
-
-// ── Confidence bar ────────────────────────────────────────────────────────────
-function ConfidenceBar({ value, prediction }) {
-  const pct = (value * 100).toFixed(1);
-  const fillClass =
-    prediction === 'Phishing'  ? 'conf-fill--phish' :
-    prediction === 'Uncertain' ? 'conf-fill--uncertain' :
-                                 'conf-fill--safe';
-  return (
-    <div className="conf-wrapper">
-      <div className="conf-labels">
-        <span className="conf-label-text">Confidence</span>
-        <span className="conf-value">{pct}%</span>
-      </div>
-      <div className="conf-track">
-        <div className={`conf-fill ${fillClass}`} style={{ width: `${pct}%` }} />
-      </div>
-    </div>
-  );
+// ── Status chip — coloured by scan pathway ───────────────────────────────────
+const STATUS_META = {
+  predicted:    { label: 'Predicted',      cls: 'chip--predicted'    },
+  cached:       { label: 'Cached',       cls: 'chip--cached'       },
+  trusted:      { label: 'Trusted',      cls: 'chip--trusted'      },
+  known:        { label: 'Known URL',    cls: 'chip--known'        },
+  skipped:      { label: 'Skipped',      cls: 'chip--skipped'      },
+  quick:        { label: 'Quick',        cls: 'chip--quick'        },
+  feed_match:   { label: 'Feed Hit',     cls: 'chip--feed'         },
+  user_reported:{ label: 'User Reported',     cls: 'chip--reported'     },
+  visual_clone: { label: 'Visual Clone', cls: 'chip--visual-clone' },
+};
+function StatusChip({ s }) {
+  const m = STATUS_META[s] || { label: s, cls: '' };
+  return <span className={`chip ${m.cls}`}>{m.label}</span>;
 }
 
-// ── Source badges ─────────────────────────────────────────────────────────────
-// Mirrors popup.js badge logic exactly, with web-app-specific status handling.
-function SourceBadges({ data }) {
-  const status     = data.status;
-  const gsbChecked = data.gsb_checked;
-  const reasons    = data.reasons || [];
-  const gsbHit     = reasons.some(r => r.feature === 'gsb');
-  const cloneHit   = reasons.some(r => r.feature === 'visual_clone');
-  const vt         = data.vt || {};
-  const vtChecked  = vt.checked;
-  const vtVerdict  = vt.verdict || 'unknown';
-  const vtMal      = vt.malicious ?? 0;
-  const vtTotal    = vt.total ?? 0;
-  const vtTrust    = vt.trust_score ?? -1;
 
-  // ── Status-specific single badge ──────────────────────────────────────────
-  // These statuses bypass the full pipeline — show a descriptive badge instead
-  // of "ML Model" which would be factually incorrect.
-  if (status === 'trusted') {
-    return <div className="badges"><span className="badge badge--trusted">✓ Verified Safe List</span></div>;
-  }
-  if (status === 'known') {
-    return <div className="badges"><span className="badge badge--known">📋 Known URL (training data)</span></div>;
-  }
-  if (status === 'user_reported') {
-    return <div className="badges"><span className="badge badge--user-reported">👤 User Reported</span></div>;
-  }
-  if (status === 'skipped') {
-    return <div className="badges"><span className="badge badge--gsb-skip">⏭ Not scannable</span></div>;
-  }
+const BASE = 'http://localhost:8000';
+const get  = path => fetch(`${BASE}${path}`).then(r => r.json()).catch(() => null);
 
-  // ── Full pipeline badges (status: 'predicted' or 'feed_match') ────────────
-  let vtBadge = null;
-  if (vtChecked) {
-    const vtClass = vtVerdict === 'malicious' ? 'badge--vt-bad'
-                  : vtVerdict === 'suspicious' ? 'badge--vt-warn'
-                  : 'badge--vt-ok';
-    const vtText  = vtVerdict === 'malicious'
-      ? `🔬 VT: ${vtMal}/${vtTotal} malicious`
-      : vtVerdict === 'suspicious'
-      ? `🔬 VT: suspicious · Trust ${vtTrust}/100`
-      : `🔬 VT: ${vtTotal} vendors · Trust ${vtTrust}/100`;
-    vtBadge = <span className={`badge ${vtClass}`}>{vtText}</span>;
-  } else if (vt.source === 'vt_skipped') {
-    vtBadge = <span className="badge badge--vt-skip">🔬 VT: No API key</span>;
+const PAGE_SIZE = 10; // rows per page in all tables
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function timeAgo(iso) {
+  if (!iso) return '—';
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 5)     return 'just now';
+  if (s < 60)    return `${s}s ago`;
+  if (s < 3600)  return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleString('en-US', {
+    month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+}
+
+function truncUrl(url, max = 52) {
+  if (!url || url.length <= max) return url;
+  return url.slice(0, max) + '…';
+}
+
+// ── Pagination controls ───────────────────────────────────────────────────────
+function Pagination({ page, totalPages, onChange }) {
+  if (totalPages <= 1) return null;
+
+  const pages = [];
+  const delta = 2;
+  const left  = Math.max(1, page - delta);
+  const right = Math.min(totalPages, page + delta);
+
+  if (left > 1) {
+    pages.push(1);
+    if (left > 2) pages.push('…');
+  }
+  for (let i = left; i <= right; i++) pages.push(i);
+  if (right < totalPages) {
+    if (right < totalPages - 1) pages.push('…');
+    pages.push(totalPages);
   }
 
   return (
-    <div className="badges">
-      <span className="badge badge--ml">🤖 ML Model</span>
-
-      {/* GSB badge */}
-      {gsbChecked === 'gsb_skipped' && (
-        <span className="badge badge--gsb-skip">🛡 GSB: No API key</span>
-      )}
-      {gsbChecked && gsbChecked !== 'gsb_skipped' && !gsbHit && (
-        <span className="badge badge--gsb-ok">🛡 GSB: Clean</span>
-      )}
-      {gsbHit && <span className="badge badge--gsb-hit">🛡 GSB: FLAGGED</span>}
-
-      {/* VT badge */}
-      {vtBadge}
-
-      {/* Visual clone badge — can't happen in web app (no screenshot API)
-          but shown if server returns it for completeness */}
-      {cloneHit && <span className="badge badge--clone">📸 Visual Clone</span>}
-
-      {/* PhishTank/OpenPhish feed signal */}
-      {reasons.some(r => r.feature === 'phishing_feed') && (
-        <span className="badge badge--feed">⚠️ PhishTank/OpenPhish</span>
-      )}
-    </div>
-  );
-}
-
-// ── Reasons list ──────────────────────────────────────────────────────────────
-function ReasonsList({ reasons, prediction, status }) {
-  if (!reasons || reasons.length === 0) return null;
-
-  // For Legitimate user_reported, show a note instead of hiding silently
-  if (prediction === 'Legitimate' && status === 'user_reported') {
-    return (
-      <p className="user-report-note">
-        ✓ This site was marked as safe by a user report. The verdict is valid for 24 hours.
-      </p>
-    );
-  }
-
-  // Show reasons only for Phishing and Uncertain (same as popup.js)
-  if (prediction !== 'Phishing' && prediction !== 'Uncertain') return null;
-
-  const title = prediction === 'Uncertain' ? 'Signals detected' : 'Why we flagged this';
-
-  return (
-    <div className="reasons">
-      <p className="reasons-title">{title}</p>
-      <ul className="reasons-list">
-        {reasons.map((r, i) => (
-          <li key={i} className={`reason reason--${r.severity}`}>
-            <span className="reason-icon">{SEVERITY_ICON[r.severity] || '⚪'}</span>
-            <span>{r.label}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-// ── Report button(s) ──────────────────────────────────────────────────────────
-// Mirrors popup.js exactly:
-//   Phishing   → "Mark as Safe (False Positive)" only
-//   Uncertain  → BOTH buttons side by side
-//   Legitimate → "Report as Phishing" only
-//   trusted / known / skipped → no buttons (system is confident)
-//
-// After a successful report, auto-refreshes the result from the server
-// so the card immediately reflects the corrected verdict.
-function ReportButtons({ url, prediction, status, onRefresh }) {
-  const [safeState,  setSafeState]  = useState('idle');
-  const [phishState, setPhishState] = useState('idle');
-
-  // Don't show buttons for system-confident statuses
-  if (status === 'trusted' || status === 'known' || status === 'skipped') return null;
-
-  const sendReport = async (reportType, setStateFn) => {
-    setStateFn('sending');
-    try {
-      const res = await fetch(REPORT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, report_type: reportType, reported_by: 'webapp' })
-      });
-      if (!res.ok) throw new Error(`Server ${res.status}`);
-      setStateFn('sent');
-      // Auto-refresh result after 600ms so user sees the corrected verdict
-      setTimeout(() => onRefresh(url), 600);
-    } catch (_) {
-      setStateFn('error');
-    }
-  };
-
-  const isPhish     = prediction === 'Phishing';
-  const isUncertain = prediction === 'Uncertain';
-
-  // Phishing → one button
-  if (isPhish) {
-    if (safeState === 'sent')  return <p className="report-thanks">✓ Marked as safe — refreshing…</p>;
-    if (safeState === 'error') return <p className="report-thanks report-thanks--error">⚠ Report failed</p>;
-    return (
-      <button
-        className="report-btn"
-        onClick={() => sendReport('false_positive', setSafeState)}
-        disabled={safeState === 'sending'}
-      >
-        {safeState === 'sending' ? 'Sending…' : 'Mark as Safe (False Positive)'}
+    <div className="pagination">
+      <button className="pg-btn" onClick={() => onChange(page - 1)} disabled={page === 1}>
+        ‹ Prev
       </button>
-    );
-  }
+      {pages.map((p, i) =>
+        p === '…'
+          ? <span key={`el-${i}`} className="pg-ellipsis">…</span>
+          : <button
+              key={p}
+              className={`pg-btn ${page === p ? 'pg-btn--on' : ''}`}
+              onClick={() => onChange(p)}
+            >{p}</button>
+      )}
+      <button className="pg-btn" onClick={() => onChange(page + 1)} disabled={page === totalPages}>
+        Next ›
+      </button>
+    </div>
+  );
+}
 
-  // Uncertain → both buttons
-  if (isUncertain) {
-    return (
-      <div className="report-pair">
-        <button
-          className="report-btn report-btn--half"
-          onClick={() => sendReport('false_positive', setSafeState)}
-          disabled={safeState === 'sending' || safeState === 'sent'}
-        >
-          {safeState === 'sending' ? 'Sending…'
-           : safeState === 'sent'  ? '✓ Done'
-           : 'Mark as Safe'}
-        </button>
-        <button
-          className="report-btn report-btn--half report-btn--danger"
-          onClick={() => sendReport('false_negative', setPhishState)}
-          disabled={phishState === 'sending' || phishState === 'sent'}
-        >
-          {phishState === 'sending' ? 'Sending…'
-           : phishState === 'sent'  ? '✓ Done'
-           : 'Report as Phishing'}
-        </button>
-      </div>
-    );
-  }
+// ── Verdict badge ─────────────────────────────────────────────────────────────
+function VBadge({ v }) {
+  if (v === 'Phishing')   return <span className="vbadge vbadge--phish">🚨 Phishing</span>;
+  if (v === 'Uncertain')  return <span className="vbadge vbadge--uncert">⚠️ Uncertain</span>;
+  if (v === 'Legitimate') return <span className="vbadge vbadge--safe">✅ Safe</span>;
+  return <span className="vbadge">{v}</span>;
+}
 
-  // Legitimate → one button
-  if (phishState === 'sent')  return <p className="report-thanks">✓ Reported — refreshing…</p>;
-  if (phishState === 'error') return <p className="report-thanks report-thanks--error">⚠ Report failed</p>;
+// ── Stat card ─────────────────────────────────────────────────────────────────
+function StatCard({ icon, label, value, accent, sub }) {
   return (
-    <button
-      className="report-btn report-btn--danger"
-      onClick={() => sendReport('false_negative', setPhishState)}
-      disabled={phishState === 'sending'}
-    >
-      {phishState === 'sending' ? 'Sending…' : 'Report as Phishing'}
+    <div className={`sc sc--${accent}`}>
+      <div className="sc-icon">{icon}</div>
+      <div className="sc-body">
+        <div className="sc-value">{value ?? '—'}</div>
+        <div className="sc-label">{label}</div>
+        {sub && <div className="sc-sub">{sub}</div>}
+      </div>
+      <div className="sc-glow" />
+    </div>
+  );
+}
+
+// ── Theme toggle ──────────────────────────────────────────────────────────────
+function ThemeToggle({ theme, onToggle }) {
+  const isLight = theme === 'light';
+  return (
+    <button className="theme-toggle" onClick={onToggle}>
+      <span className="theme-toggle-label">
+        <span className="theme-toggle-icon">{isLight ? '☀️' : '🌙'}</span>
+        {isLight ? 'Light Mode' : 'Dark Mode'}
+      </span>
+      <span className="theme-toggle-switch" />
     </button>
   );
 }
 
-// ── App ───────────────────────────────────────────────────────────────────────
-export default function App() {
-  const [url,     setUrl]     = useState('');
-  const [result,  setResult]  = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error,   setError]   = useState('');
+// ── Refresh button ─────────────────────────────────────────────────────────────
+function RefreshBtn({ onClick, loading }) {
+  return (
+    <button className={`refresh-btn ${loading ? 'refresh-btn--spin' : ''}`} onClick={onClick}>
+      ↺ {loading ? 'Refreshing…' : 'Refresh'}
+    </button>
+  );
+}
 
-  const runScan = async (targetUrl) => {
-    setLoading(true); setError(''); setResult(null);
+// ══════════════════════════════════════════════════════════════════════════════
+// OVERVIEW TAB
+// ══════════════════════════════════════════════════════════════════════════════
+function OverviewTab({ stats, loading, onRefresh }) {
+  if (!stats && !loading) return (
+    <div className="empty-state">
+      <div className="empty-icon">🔌</div>
+      <p>Cannot reach the backend at <code>localhost:8000</code>.</p>
+      <p className="muted">Make sure the FastAPI server is running.</p>
+      <button className="refresh-btn" onClick={onRefresh}>Retry</button>
+    </div>
+  );
+
+  const s         = stats || {};
+  const rate      = s.phishing_rate ?? 0;
+  const rateColor = rate > 20 ? 'red' : rate > 8 ? 'amber' : 'green';
+
+  return (
+    <div className="tab-content">
+      <div className="section-hdr">
+        <h2>System Overview</h2>
+        <RefreshBtn onClick={onRefresh} loading={loading} />
+      </div>
+
+      <div className="sc-grid">
+        <StatCard icon="🔍" label="Total Scans"       value={(s.total_scans ?? 0).toLocaleString()} accent="blue" />
+        <StatCard icon="🚨" label="Phishing Detected" value={(s.phishing ?? 0).toLocaleString()}     accent="red"
+          sub={`${rate}% of all scans`} />
+        <StatCard icon="⚠️" label="Uncertain"         value={(s.uncertain ?? 0).toLocaleString()}    accent="amber" />
+        <StatCard icon="✅" label="Legitimate"         value={(s.legitimate ?? 0).toLocaleString()}   accent="green" />
+        <StatCard icon="📸" label="Hash DB Size"       value={s.hash_db_size ?? 0}                   accent="purple"
+          sub="Phishing page hashes" />
+        <StatCard icon="📋" label="User Reports"       value={s.reports ?? 0}                        accent="blue"
+          sub="False pos / neg" />
+      </div>
+
+      {/* Phishing rate bar */}
+      <div className="panel">
+        <div className="panel-title">📈 Phishing Detection Rate</div>
+        <div className="rate-row">
+          <div className="rate-bar-wrap">
+            <div className={`rate-bar rate-bar--${rateColor}`} style={{ width: `${Math.min(rate, 100)}%` }} />
+          </div>
+          <span className={`rate-val rate-val--${rateColor}`}>{rate}%</span>
+        </div>
+        <div className="rate-legend">
+          <span><span className="dot dot--green" /> Safe ({(s.legitimate ?? 0).toLocaleString()})</span>
+          <span><span className="dot dot--amber" /> Uncertain ({(s.uncertain ?? 0).toLocaleString()})</span>
+          <span><span className="dot dot--red"   /> Phishing ({(s.phishing ?? 0).toLocaleString()})</span>
+        </div>
+      </div>
+
+      {/* Top flagged domains */}
+      {s.top_flagged_domains?.length > 0 && (
+        <div className="panel">
+          <div className="panel-title">🎯 Most Flagged Domains</div>
+          <div className="domain-list">
+            {s.top_flagged_domains.map(([domain, count], i) => {
+              const maxCount = s.top_flagged_domains[0][1];
+              return (
+                <div key={domain} className="domain-row">
+                  <span className="domain-rank mono">#{i + 1}</span>
+                  <span className="domain-name mono">{domain}</span>
+                  <div className="domain-track">
+                    <div className="domain-fill" style={{ width: `${(count / maxCount) * 100}%` }} />
+                  </div>
+                  <span className="domain-count">{count}×</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Status pills */}
+      <div className="status-row">
+        <div className={`status-pill ${s.feed_status?.loaded ? 'status-pill--ok' : 'status-pill--err'}`}>
+          {s.feed_status?.loaded ? '✅' : '❌'} PhishTank / OpenPhish
+          {s.feed_status?.url_count > 0 && (
+            <span className="muted"> · {s.feed_status.url_count.toLocaleString()} URLs</span>
+          )}
+        </div>
+        <div className={`status-pill ${s.whitelist?.tranco?.loaded ? 'status-pill--ok' : 'status-pill--warn'}`}>
+          {s.whitelist?.tranco?.loaded ? '✅' : '⏳'} Tranco Whitelist
+          {s.whitelist?.tranco?.domain_count > 0 && (
+            <span className="muted"> · {s.whitelist.tranco.domain_count.toLocaleString()} domains</span>
+          )}
+        </div>
+        <div className="status-pill status-pill--ok">
+          🗄️ Cache: {(s.cache_stats?.result_cache ?? 0) + (s.cache_stats?.whois_cache ?? 0) + (s.cache_stats?.vt_cache ?? 0)} entries
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SCAN HISTORY TAB  — 10 rows per page with pagination
+// ══════════════════════════════════════════════════════════════════════════════
+function ScanHistoryTab({ history, loading, onRefresh }) {
+  const [filter, setFilter] = useState('all');
+  const [search, setSearch] = useState('');
+  const [page,   setPage]   = useState(1);
+
+  const handleFilter = (f) => { setFilter(f); setPage(1); };
+  const handleSearch = (v) => { setSearch(v);  setPage(1); };
+
+  const filtered = (history || []).filter(h => {
+    if (filter !== 'all' && h.prediction.toLowerCase() !== filter) return false;
+    if (search && !h.url.toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  });
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const safePage   = Math.min(page, totalPages);
+  const pageItems  = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  const counts = {
+    all:        (history || []).length,
+    phishing:   (history || []).filter(h => h.prediction === 'Phishing').length,
+    uncertain:  (history || []).filter(h => h.prediction === 'Uncertain').length,
+    legitimate: (history || []).filter(h => h.prediction === 'Legitimate').length,
+  };
+
+  return (
+    <div className="tab-content">
+      <div className="section-hdr">
+        <h2>Scan History</h2>
+        <RefreshBtn onClick={onRefresh} loading={loading} />
+      </div>
+
+      <div className="toolbar">
+        <input
+          className="search-inp"
+          placeholder="🔍 Filter by URL…"
+          value={search}
+          onChange={e => handleSearch(e.target.value)}
+        />
+        <div className="pills">
+          {['all', 'phishing', 'uncertain', 'legitimate'].map(f => (
+            <button
+              key={f}
+              className={`pill pill--${f} ${filter === f ? 'pill--on' : ''}`}
+              onClick={() => handleFilter(f)}
+            >
+              {f.charAt(0).toUpperCase() + f.slice(1)}
+              <span className="pill-count">{counts[f]}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="tbl-wrap">
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th className="th-num">#</th>
+              <th>URL</th>
+              <th>Verdict</th>
+              <th>Confidence</th>
+              <th>Status</th>
+              <th>When</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pageItems.length === 0 && (
+              <tr>
+                <td colSpan="6" className="tbl-empty">
+                  {loading
+                    ? 'Loading…'
+                    : (history || []).length === 0
+                      ? 'No scans recorded yet. Scan a URL using the extension or browser.'
+                      : 'No results match the filter.'}
+                </td>
+              </tr>
+            )}
+            {pageItems.map((h, i) => {
+              // Recent entry = #1, older entries get higher numbers
+              const absNum = (safePage - 1) * PAGE_SIZE + i + 1;
+              return (
+                <tr key={i} className={`trow trow--${h.prediction.toLowerCase()}`}>
+                  <td className="mono muted td-num">{absNum}</td>
+                  <td className="td-url">
+                    <a href={h.url} target="_blank" rel="noopener noreferrer"
+                       className="url-link mono" title={h.url}>
+                      {truncUrl(h.url)}
+                    </a>
+                  </td>
+                  <td><VBadge v={h.prediction} /></td>
+                  <td className="mono td-conf">{(h.confidence * 100).toFixed(1)}%</td>
+                  <td><StatusChip s={h.status} /></td>
+                  <td className="mono muted td-time" title={h.timestamp}>{timeAgo(h.timestamp)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="tbl-footer tbl-footer--flex">
+        <span>
+          Showing <strong>{(safePage - 1) * PAGE_SIZE + 1}–{(safePage - 1) * PAGE_SIZE + pageItems.length}</strong> of{' '}
+          <strong>{filtered.length}</strong> entries
+          {filtered.length !== (history || []).length &&
+            ` (filtered from ${(history || []).length} total)`}
+        </span>
+        <Pagination page={safePage} totalPages={totalPages} onChange={setPage} />
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HASH MANAGER TAB  — shows URL source for each hash, paginated
+// ══════════════════════════════════════════════════════════════════════════════
+function HashManagerTab({ hashes, loading, onRefresh }) {
+  const [deleting, setDeleting] = useState(null);
+  const [msg,      setMsg]      = useState('');
+  const [search,   setSearch]   = useState('');
+  const [page,     setPage]     = useState(1);
+
+  const deleteHash = async (h) => {
+    setDeleting(h);
+    setMsg('');
     try {
-      const res  = await fetch(API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: targetUrl })
-      });
+      const res  = await fetch(`${BASE}/hash/delete?hash_str=${encodeURIComponent(h)}`, { method: 'DELETE' });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || 'Prediction failed');
-      setResult({ ...data, _submittedUrl: targetUrl });
-    } catch (err) {
-      setError(err.message || 'Request failed');
+      if (res.ok) {
+        setMsg(`✓ Removed hash for: ${hashUrlMap[h] || h.slice(0, 16) + '…'}`);
+        onRefresh();
+      } else {
+        setMsg(`✗ ${data.detail || 'Delete failed'}`);
+      }
+    } catch {
+      setMsg('✗ Network error');
     } finally {
-      setLoading(false);
+      setDeleting(null);
     }
   };
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!url.trim()) return;
-    await runScan(url.trim());
-  };
+  // hash → url lookup (sent by the updated /hash/list endpoint)
+  const hashUrlMap = hashes?.hash_url_map || {};
 
-  // Called by ReportButtons after a successful report — re-fetches the
-  // corrected cached result so the card updates without user re-submitting.
-  const handleRefresh = (targetUrl) => {
-    runScan(targetUrl);
-  };
+  // Search works across both hash string and the associated URL
+  const list = (hashes?.hashes || []).filter(h => {
+    if (!search) return true;
+    const url = hashUrlMap[h] || '';
+    return h.includes(search) || url.toLowerCase().includes(search.toLowerCase());
+  });
 
-  const prediction = result?.prediction ?? null;
-  const vc         = prediction ? verdictClass(prediction) : null;
+  const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+  const safePage   = Math.min(page, totalPages);
+  const pageItems  = list.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
   return (
-    <div className="app">
-      <header className="header">
-        <h1>🔍 PhishGuard</h1>
-        <p>Advanced phishing detection</p>
-      </header>
+    <div className="tab-content">
+      <div className="section-hdr">
+        <h2>Phishing Hash Database</h2>
+        <RefreshBtn onClick={onRefresh} loading={loading} />
+      </div>
 
-      <main className="main">
-        <form onSubmit={handleSubmit} className="form">
-          <div className="input-row">
-            <input
-              type="url"
-              value={url}
-              onChange={e => setUrl(e.target.value)}
-              placeholder="https://example.com"
-              className={`url-input${
-                vc === 'phish'     ? ' url-input--phish' :
-                vc === 'uncertain' ? ' url-input--uncertain' : ''}`}
-              required
-            />
-            <button type="submit" disabled={loading} className="submit-btn">
-              {loading ? 'Analysing…' : 'Check URL'}
-            </button>
+      {msg && (
+        <div className={`alert ${msg.startsWith('✓') ? 'alert--ok' : 'alert--err'}`}>{msg}</div>
+      )}
+
+      <div className="panel">
+        {/* Header row — count + ImageHash status */}
+        <div className="hash-meta-row">
+          <div className="hash-meta-stat">
+            <span className="hash-meta-num">{hashes?.db_size ?? 0}</span>
+            <span className="hash-meta-lbl">hashes stored</span>
           </div>
-        </form>
+          <div className={`hash-avail ${hashes?.imagehash_available ? 'hash-avail--ok' : 'hash-avail--err'}`}>
+            {hashes?.imagehash_available ? '✅ ImageHash ready' : '❌ ImageHash not installed'}
+          </div>
+        </div>
 
-        {error && <div className="error-banner">⚠ {error}</div>}
-
-        {result && (
-          <div className={`card card--${vc}`}>
-
-            {/* Verdict */}
-            <div className="verdict-row">
-              <span className="verdict-emoji">{verdictIcon(prediction)}</span>
-              <div>
-                <h2 className="verdict-title">{prediction}</h2>
-                <p className="verdict-message">{result.message}</p>
-              </div>
-            </div>
-
-            {/* Source badges */}
-            <SourceBadges data={result} />
-
-            {/* Confidence bar */}
-            <ConfidenceBar value={result.confidence} prediction={prediction} />
-
-            {/* Reasons */}
-            <ReasonsList
-              reasons={result.reasons}
-              prediction={prediction}
-              status={result.status}
-            />
-
-            {/* Raw feature vector — only for full ML predictions */}
-            {result.status === 'predicted' && result.features &&
-              Object.keys(result.features).length > 0 && (
-              <details className="feature-details">
-                <summary>
-                  ▶ Raw feature vector ({Object.keys(result.features).length} features)
-                </summary>
-                <pre className="feature-pre">
-                  {JSON.stringify(result.features, null, 2)}
-                </pre>
-              </details>
-            )}
-
-            {/* Report buttons with auto-refresh */}
-            <ReportButtons
-              url={result._submittedUrl}
-              prediction={prediction}
-              status={result.status}
-              onRefresh={handleRefresh}
-            />
+        {!hashes?.imagehash_available && (
+          <div className="info-box">
+            Install ImageHash to enable visual clone detection:<br/>
+            <code>pip install Pillow ImageHash --break-system-packages</code>
           </div>
         )}
+
+        <input
+          className="search-inp"
+          placeholder="🔍 Filter by URL or hash…"
+          value={search}
+          onChange={e => { setSearch(e.target.value); setPage(1); }}
+          style={{ marginBottom: '12px' }}
+        />
+
+        {list.length === 0 ? (
+          <div className="empty-state" style={{ padding: '2rem 0' }}>
+            <div className="empty-icon">📸</div>
+            <p>{loading ? 'Loading…' : 'No phishing hashes stored.'}</p>
+            <p className="muted">
+              When the extension detects a phishing page and you click<br/>
+              "Report as Phishing", a perceptual hash of that page's screenshot<br/>
+              is stored here for future visual clone detection.
+              Most recently added hashes appear at the top.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Column headers */}
+            <div className="hash-list-header">
+              <span className="hash-col-idx">#</span>
+              <span className="hash-col-url">Source URL</span>
+              <span className="hash-col-hash">Perceptual Hash</span>
+              <span className="hash-col-del" />
+            </div>
+
+            <div className="hash-list">
+              {pageItems.map((h, i) => {
+                const sourceUrl = hashUrlMap[h];
+                return (
+                  <div key={h} className="hash-row">
+                    <span className="hash-idx mono muted hash-col-idx">
+                      #{(safePage - 1) * PAGE_SIZE + i + 1}
+                    </span>
+
+                    {/* Source URL — clickable link if known, fallback label if not */}
+                    <span className="hash-col-url">
+                      {sourceUrl
+                        ? <a href={sourceUrl} target="_blank" rel="noopener noreferrer"
+                             className="hash-url-link" title={sourceUrl}>
+                            {sourceUrl.length > 55 ? sourceUrl.slice(0, 55) + '…' : sourceUrl}
+                          </a>
+                        : <span className="hash-no-url muted">Unknown origin</span>
+                      }
+                    </span>
+
+                    <span className="hash-val mono hash-col-hash">{h}</span>
+
+                    <button
+                      className="btn-del hash-col-del"
+                      onClick={() => deleteHash(h)}
+                      disabled={deleting === h}
+                      title={sourceUrl ? `Remove hash for ${sourceUrl}` : 'Remove this hash'}
+                    >
+                      {deleting === h ? '…' : '🗑️'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="tbl-footer tbl-footer--flex" style={{ marginTop: '10px' }}>
+              <span>
+                Showing <strong>{pageItems.length}</strong> of <strong>{list.length}</strong> hashes
+              </span>
+              <Pagination page={safePage} totalPages={totalPages} onChange={setPage} />
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REPORTS TAB
+// — "Reported By" column removed (value is always "popup")
+// — summary cards are now clickable filter buttons
+// — paginated, 10 rows per page
+// ══════════════════════════════════════════════════════════════════════════════
+function ReportsTab({ reports, loading, onRefresh }) {
+  const [filter, setFilter] = useState('all');  // 'all' | 'false_positive' | 'false_negative'
+  const [page,   setPage]   = useState(1);
+
+  const handleFilter = (f) => {
+    setFilter(prev => prev === f ? 'all' : f); // clicking active filter deselects it
+    setPage(1);
+  };
+
+  const all        = [...(reports?.reports || [])].reverse();
+  const fpCount    = all.filter(r => r.report_type === 'false_positive').length;
+  const fnCount    = all.filter(r => r.report_type === 'false_negative').length;
+
+  const list       = filter === 'all' ? all : all.filter(r => r.report_type === filter);
+  const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+  const safePage   = Math.min(page, totalPages);
+  const pageItems  = list.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  return (
+    <div className="tab-content">
+      <div className="section-hdr">
+        <h2>User Reports Log</h2>
+        <RefreshBtn onClick={onRefresh} loading={loading} />
+      </div>
+
+      {/* Clickable filter cards */}
+      <div className="reports-summary">
+        <button
+          className={`report-stat report-stat--fp ${filter === 'false_positive' ? 'report-stat--on' : ''}`}
+          onClick={() => handleFilter('false_positive')}
+          title="Click to filter by False Positives"
+        >
+          <span className="report-stat-num">{fpCount}</span>
+          <span className="report-stat-lbl">
+            False Positives<br/><small>(marked as safe)</small>
+          </span>
+          <span className="report-stat-hint">
+            {filter === 'false_positive' ? '✕ Clear filter' : 'Click to filter'}
+          </span>
+        </button>
+        <button
+          className={`report-stat report-stat--fn ${filter === 'false_negative' ? 'report-stat--on' : ''}`}
+          onClick={() => handleFilter('false_negative')}
+          title="Click to filter by False Negatives"
+        >
+          <span className="report-stat-num">{fnCount}</span>
+          <span className="report-stat-lbl">
+            False Negatives<br/><small>(reported phishing)</small>
+          </span>
+          <span className="report-stat-hint">
+            {filter === 'false_negative' ? '✕ Clear filter' : 'Click to filter'}
+          </span>
+        </button>
+      </div>
+
+      <div className="tbl-wrap">
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th className="th-num">#</th>
+              <th>URL</th>
+              <th>Report Type</th>
+              <th>Corrected To</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pageItems.length === 0 && (
+              <tr>
+                <td colSpan="5" className="tbl-empty">
+                  {loading ? 'Loading…' : 'No reports submitted yet.'}
+                </td>
+              </tr>
+            )}
+            {pageItems.map((r, i) => (
+              <tr key={i} className={`trow trow--${r.report_type === 'false_positive' ? 'legitimate' : 'phishing'}`}>
+                <td className="mono muted td-num">
+                  {/* Recent = #1, older = higher numbers */}
+                  {(safePage - 1) * PAGE_SIZE + i + 1}
+                </td>
+                <td className="td-url">
+                  <a href={r.url} target="_blank" rel="noopener noreferrer"
+                     className="url-link mono" title={r.url}>
+                    {truncUrl(r.url)}
+                  </a>
+                </td>
+                <td>
+                  <span className={`chip ${r.report_type === 'false_positive' ? 'chip--fp' : 'chip--fn'}`}>
+                    {r.report_type === 'false_positive' ? '✓ False Positive' : '⚠ False Negative'}
+                  </span>
+                </td>
+                <td><VBadge v={r.corrected_to} /></td>
+                <td className="mono muted td-time" title={r.timestamp}>{timeAgo(r.timestamp)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="tbl-footer tbl-footer--flex">
+        <span>
+          {filter !== 'all'
+            ? <>Showing <strong>{list.length}</strong> {filter === 'false_positive' ? 'false positive' : 'false negative'} report{list.length !== 1 ? 's' : ''}</>
+            : <>{all.length} total report{all.length !== 1 ? 's' : ''}</>
+          }
+        </span>
+        <Pagination page={safePage} totalPages={totalPages} onChange={setPage} />
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SYSTEM STATUS TAB
+// — API Endpoints section removed
+// — VT Cache TTL corrected to 24h (matches app.py ttl=86400)
+// ══════════════════════════════════════════════════════════════════════════════
+function SystemTab({ stats, loading, onRefresh }) {
+  const [clearing, setClearing] = useState(false);
+  const [clearMsg, setClearMsg] = useState('');
+
+  const clearCache = async () => {
+    setClearing(true);
+    setClearMsg('');
+    try {
+      const res  = await fetch(`${BASE}/cache/clear`, { method: 'POST' });
+      const data = await res.json();
+      const { result_cache: r, whois_cache: w, vt_cache: v } = data.cleared || {};
+      setClearMsg(`✓ Cleared ${(r||0)+(w||0)+(v||0)} entries (result: ${r}, whois: ${w}, vt: ${v})`);
+      onRefresh();
+    } catch {
+      setClearMsg('✗ Failed — is the server running?');
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  if (!stats && !loading) return (
+    <div className="empty-state">
+      <div className="empty-icon">🔌</div>
+      <p className="muted">Backend unreachable</p>
+    </div>
+  );
+
+  const { cache_stats, feed_status, whitelist } = stats || {};
+
+  return (
+    <div className="tab-content">
+      <div className="section-hdr">
+        <h2>System Status</h2>
+        <RefreshBtn onClick={onRefresh} loading={loading} />
+      </div>
+
+      {/* Cache */}
+      <div className="panel">
+        <div className="panel-title">🗄️ Cache</div>
+        <div className="kv-grid">
+          {/* All three caches use ttl=86400 (24h) in app.py */}
+          <KVRow k="Result Cache" v={`${cache_stats?.result_cache ?? '—'} entries`} icon="📦" note="24h TTL" />
+          <KVRow k="WHOIS Cache"  v={`${cache_stats?.whois_cache  ?? '—'} entries`} icon="📋" note="24h TTL" />
+          <KVRow k="VT Cache"     v={`${cache_stats?.vt_cache     ?? '—'} entries`} icon="🔬" note="24h TTL" />
+        </div>
+        {clearMsg && (
+          <div className={`alert ${clearMsg.startsWith('✓') ? 'alert--ok' : 'alert--err'}`}>
+            {clearMsg}
+          </div>
+        )}
+        <button className="btn-danger" onClick={clearCache} disabled={clearing}>
+          {clearing ? '⏳ Clearing…' : '🗑️ Clear All Caches'}
+        </button>
+        <p className="panel-note">
+          Forces fresh scans for all URLs — use after updating detection logic.
+        </p>
+      </div>
+
+      {/* Phishing feeds */}
+      <div className="panel">
+        <div className="panel-title">📡 Phishing Feeds (PhishTank + OpenPhish)</div>
+        <div className="kv-grid">
+          <KVRow
+            k="Status"
+            v={feed_status?.loaded ? 'Loaded ✅' : 'Not loaded ❌'}
+            cls={feed_status?.loaded ? 'text-green' : 'text-red'}
+            icon="🟢"
+          />
+          <KVRow k="URL Count" v={(feed_status?.url_count ?? 0).toLocaleString() + ' known phishing URLs'} icon="🔗" />
+          <KVRow k="Sources"   v={feed_status?.sources?.join(', ') || '—'}                                  icon="📌" />
+          <KVRow k="Loaded At" v={feed_status?.loaded_at ? fmtTime(feed_status.loaded_at) : '—'}            icon="🕒" />
+          {feed_status?.error && <KVRow k="Error" v={feed_status.error} cls="text-red" icon="⚠️" />}
+        </div>
+        <p className="panel-note">
+          Feeds are refreshed on server restart. Restart daily for maximum freshness.
+        </p>
+      </div>
+
+      {/* Whitelist */}
+      <div className="panel">
+        <div className="panel-title">🛡️ Domain Whitelist</div>
+        <div className="kv-grid">
+          <KVRow
+            k="Tranco Status"
+            v={whitelist?.tranco?.loaded ? 'Loaded ✅' : 'Loading… ⏳'}
+            cls={whitelist?.tranco?.loaded ? 'text-green' : 'text-amber'}
+            icon="📊"
+          />
+          <KVRow k="Tranco Domains" v={(whitelist?.tranco?.domain_count ?? 0).toLocaleString() + ' domains'} icon="🌐" />
+          <KVRow k="Static Domains" v={(whitelist?.static_count ?? 0).toLocaleString() + ' domains'}         icon="📄" />
+          <KVRow k="Source"         v={whitelist?.tranco?.source || '—'}                                     icon="📥" />
+          <KVRow
+            k="Total Trusted"
+            v={((whitelist?.tranco?.domain_count ?? 0) + (whitelist?.static_count ?? 0)).toLocaleString()}
+            icon="✅"
+          />
+          {whitelist?.tranco?.loaded_at && (
+            <KVRow k="Loaded At" v={fmtTime(whitelist.tranco.loaded_at)} icon="🕒" />
+          )}
+        </div>
+        <p className="panel-note">
+          Tranco Top-5000 domains are trusted automatically — no ML inference needed.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function KVRow({ k, v, cls = '', icon = '', note = '' }) {
+  return (
+    <div className="kv-row">
+      <span className="kv-icon">{icon}</span>
+      <span className="kv-key">{k}</span>
+      <span className={`kv-val mono ${cls}`}>
+        {v}{note && <span className="muted"> · {note}</span>}
+      </span>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// APP SHELL
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+
+
+const TABS = [
+  { id: 'overview',  icon: '📊', label: 'Overview'     },
+  { id: 'history',   icon: '📜', label: 'Scan History' },
+  { id: 'hashes',    icon: '📸', label: 'Hash DB'      },
+  { id: 'reports',   icon: '📋', label: 'User Reports'      },
+
+  { id: 'system',    icon: '⚙️', label: 'System Status'       },
+];
+
+// The 30s poll keeps the dashboard live while the browser extension scans
+// URLs in the background — new scan history entries, updated cache counts,
+// and new user reports all appear automatically without manual Refresh.
+const REFRESH_INTERVAL_MS = 30_000;
+
+export default function App() {
+  const [tab,        setTab]        = useState('overview');
+  const [loading,    setLoading]    = useState(false);
+  const [stats,      setStats]      = useState(null);
+  const [history,    setHistory]    = useState(null);
+  const [hashes,     setHashes]     = useState(null);
+  const [reports,    setReports]    = useState(null);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [online,     setOnline]     = useState(false);
+  const [theme,      setTheme]      = useState(
+    () => localStorage.getItem('phishguard-theme') || 'dark'
+  );
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('phishguard-theme', theme);
+  }, [theme]);
+
+  const toggleTheme = useCallback(() => {
+    setTheme(t => (t === 'dark' ? 'light' : 'dark'));
+  }, []);
+
+  const fetchAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [s, h, hs, r] = await Promise.all([
+        get('/admin-stats'),
+        get('/scan-history?limit=500'),
+        get('/hash/list'),
+        get('/reports'),
+      ]);
+      setStats(s);
+      setHistory(h?.history ?? []);
+      setHashes(hs);
+      setReports(r);
+      setOnline(!!s);
+      setLastUpdate(new Date().toLocaleTimeString());
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchAll();
+    const t = setInterval(fetchAll, REFRESH_INTERVAL_MS);
+    return () => clearInterval(t);
+  }, [fetchAll]);
+
+  return (
+    <div className="shell">
+      {/* ── Sidebar ── */}
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-icon">🛡️</div>
+          <div className="brand-text">
+            <div className="brand-name">PhishGuard</div>
+            <div className="brand-sub">Admin Console</div>
+          </div>
+        </div>
+
+        <nav className="nav">
+          {TABS.map(t => (
+            <button
+              key={t.id}
+              className={`nav-item ${tab === t.id ? 'nav-item--on' : ''}`}
+              onClick={() => setTab(t.id)}
+            >
+              <span className="nav-icon">{t.icon}</span>
+              <span className="nav-label">{t.label}</span>
+              {tab === t.id && <span className="nav-indicator" />}
+            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-foot">
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
+          <div className={`api-status ${online ? 'api-status--ok' : 'api-status--off'}`}>
+            <span className="status-dot" />
+            {online ? 'API Online' : 'API Offline'}
+          </div>
+          {lastUpdate && <div className="last-update">Updated {lastUpdate}</div>}
+          <div className="auto-refresh-note">Auto-refresh every 30s</div>
+        </div>
+      </aside>
+
+      {/* ── Main ── */}
+      <main className="main-area">
+        <div className="main-inner">
+          {tab === 'overview' && <OverviewTab stats={stats}    loading={loading} onRefresh={fetchAll} />}
+          {tab === 'history'  && <ScanHistoryTab history={history} loading={loading} onRefresh={fetchAll} />}
+          {tab === 'hashes'   && <HashManagerTab hashes={hashes}   loading={loading} onRefresh={fetchAll} />}
+          {tab === 'reports'  && <ReportsTab  reports={reports} loading={loading} onRefresh={fetchAll} />}
+          {tab === 'system'   && <SystemTab   stats={stats}    loading={loading} onRefresh={fetchAll} />}
+        </div>
       </main>
     </div>
   );

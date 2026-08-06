@@ -1,19 +1,71 @@
 const API_URL        = 'http://localhost:8000/predict';
 const REPORT_URL     = 'http://localhost:8000/report';
 
-// Remember the current tab URL globally so report button always has it
-let _currentTabUrl = '';
+// ── Screenshot-safe capture ─────────────────────────────────────────────────
+// Always hide the content.js overlay banner before capturing a screenshot,
+// then restore it. Prevents the banner from being baked into stored/compared
+// perceptual hashes (see content.js for full explanation of the bug this fixes).
+async function captureCleanScreenshot(tabId, windowId = null) {
+  let hideResult = null;
+  try {
+    hideResult = await chrome.tabs.sendMessage(tabId, { action: 'hideOverlay' });
+  } catch (err) {
+    // Common cause: content.js hasn't been injected into this tab yet — e.g.
+    // the tab was open before the extension was installed/reloaded, or this
+    // is the first scan on this tab this session. This is EXPECTED and
+    // harmless: if content.js never ran, there is no overlay banner to hide
+    // in the first place, so the screenshot is already clean.
+    // Logged at console.debug (not console.warn) so it doesn't get flagged
+    // as an "Error" on the extension's chrome://extensions Errors page —
+    // Chrome surfaces console.warn there, which made this benign, already-
+    // handled fallback look like a real bug.
+    console.debug('[PhishGuard] hideOverlay skipped (content script not present on this tab) — '
+      + 'proceeding with capture as-is.', err?.message || err);
+  }
+
+  // BUGFIX (mirrors background.js fix): requestAnimationFrame fires on the
+  // POPUP window's repaint cycle, NOT the tab's.  The orange overlay may
+  // therefore still be pixel-visible in the tab when captureVisibleTab runs,
+  // baking the banner into stored pHashes and causing mismatches on every
+  // subsequent rescan.  setTimeout(50) gives the tab a full repaint cycle
+  // (≥1 × 16 ms frame) before we grab the screenshot — same fix applied to
+  // background.js at the time MV3 service-worker support was added.
+  await new Promise(resolve => setTimeout(resolve, 50));
+
+  let dataUrl = null;
+  try {
+    // BUGFIX: pass the explicit windowId instead of null so we always capture
+    // the correct browser window even when called from the popup context,
+    // where captureVisibleTab(null) can resolve to the popup's own window.
+    dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+  } finally {
+    if (hideResult?.hidden) {
+      try { await chrome.tabs.sendMessage(tabId, { action: 'restoreOverlay' }); }
+      catch (_) {}
+    }
+  }
+  return dataUrl;
+}
+
+// Remember the current tab URL/ID globally so report button always has it
+let _currentTabUrl      = '';
+let _currentTabId       = null;
+let _currentTabWindowId = null;   // BUGFIX: needed for captureCleanScreenshot(tabId, windowId)
 
 // ── On popup open: get current tab URL immediately ────────────────────────────
 // This ensures _currentTabUrl is always set even before a manual scan
 chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
   if (tab?.url) _currentTabUrl = tab.url;
+  if (tab?.id != null) _currentTabId = tab.id;
+  if (tab?.windowId != null) _currentTabWindowId = tab.windowId;
 });
 
 // ── Scan button ───────────────────────────────────────────────────────────────
 document.getElementById('scan').onclick = async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  _currentTabUrl = tab.url;  // always keep it fresh
+  _currentTabUrl      = tab.url;  // always keep it fresh
+  _currentTabId       = tab.id;
+  _currentTabWindowId = tab.windowId;  // BUGFIX: needed for correct capture window
 
   const btn = document.getElementById('scan');
   btn.textContent = 'Scanning…';
@@ -22,9 +74,14 @@ document.getElementById('scan').onclick = async () => {
 
   try {
     // ── Capture screenshot + /predict simultaneously ──────────────────────────
+    // scanScreenshotUrl is exposed outside the IIFE so the hash/add call below
+    // can save the screenshot to the pHash DB when the result is Phishing.
+    let scanScreenshotUrl = null;
     const screenshotPromise = (async () => {
       try {
-        const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
+        const dataUrl = await captureCleanScreenshot(tab.id, tab.windowId);
+        if (!dataUrl) return null;
+        scanScreenshotUrl = dataUrl;   // expose for hash/add below
         const res = await fetch('http://localhost:8000/screenshot', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -37,7 +94,9 @@ document.getElementById('scan').onclick = async () => {
     const predictPromise = fetch(API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: tab.url })
+      // manual: true tells the backend this is a user-initiated scan, so
+      // "trusted" verdicts still get logged to Scan History / Total Scans.
+      body: JSON.stringify({ url: tab.url, manual: true })
     });
 
     const [res, screenshotResult] = await Promise.all([predictPromise, screenshotPromise]);
@@ -45,21 +104,57 @@ document.getElementById('scan').onclick = async () => {
     if (!res.ok) throw new Error(data.detail || 'Prediction failed');
 
     // ── Visual clone override ─────────────────────────────────────────────────
-    const userReportedSafe = data.status === 'user_reported' && data.prediction === 'Legitimate';
-    if (screenshotResult?.is_clone && !userReportedSafe && data.prediction !== 'Phishing') {
+    const isUserReported = data.status === 'user_reported';
+    // BUGFIX: skip the override entirely when data.status === 'cached'.
+    // /screenshot's URL fast-path matches _URL_TO_HASH regardless of whether
+    // /predict itself served this scan from cache or ran fresh. Without this
+    // guard, a plain repeat scan within the same server session (cache hit,
+    // correctly logged as "cached" in scan history) would still get relabeled
+    // "Visual Clone" on screen — even though nothing new was detected, and
+    // the backend intentionally does NOT re-derive visual-clone status on
+    // cache hits (see app.py's /predict cache-hit branch for the same rule).
+    // Visual-clone detection should only ever apply to a genuinely FRESH scan
+    // (e.g. right after a server restart, when the hash DB persisted but the
+    // in-memory result cache did not).
+    if (screenshotResult?.is_clone && !isUserReported && data.status !== 'cached') {
+      // BUGFIX: removed `&& data.prediction !== 'Phishing'` from the condition.
+      // Previously, when /predict already returned 'Phishing' (e.g. via PhishTank
+      // or ML), this entire block was skipped — so the visual-clone message,
+      // reasons, and cache/update call were all silently dropped.  After a server
+      // restart the rescan showed 'Phishing' with ML/feed reasons only, with no
+      // indication that the page matched a stored pHash.
       data.prediction = 'Phishing';
-      data.confidence = Math.max(data.confidence ?? 0, 0.95);
+      data.confidence = Math.max(data.confidence ?? 0, 0.99);
       data.message    = 'Page design matches a known phishing template';
-      data.reasons    = [
-        { label: 'Page visually clones a known phishing site',
-          severity: 'high', feature: 'visual_clone', value: 1 },
-        ...(data.reasons || [])
-      ];
+      if (!(data.reasons || []).some(r => r.feature === 'visual_clone')) {
+        data.reasons = [
+          { label: 'Page visually clones a known phishing site',
+            severity: 'high', feature: 'visual_clone', value: 1 },
+          ...(data.reasons || [])
+        ];
+      }
       // Write overridden result back to server cache for consistency
       fetch('http://localhost:8000/cache/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: tab.url, result: { ...data, status: 'predicted' } })
+        body: JSON.stringify({ url: tab.url, result: { ...data, status: 'visual_clone' } })
+      }).catch(() => {});
+    }
+
+    // ── Auto-save screenshot to pHash DB when system detects phishing ──────
+    // Mirrors background.js behaviour (line: "if (prediction === 'Phishing'…)").
+    // Rules:
+    //   • Only on FRESH scans — if data.status is 'cached' or 'visual_clone'
+    //     the hash already exists; no need (and wasteful) to re-add it.
+    //   • Not for 'user_reported' — the sendReport() path handles those.
+    //   • Only when we actually have a screenshot to hash.
+    const isFreshScan = !['cached', 'visual_clone'].includes(data.status);
+    if (data.prediction === 'Phishing' && scanScreenshotUrl
+        && data.status !== 'user_reported' && isFreshScan) {
+      fetch('http://localhost:8000/hash/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: tab.url, screenshot: scanScreenshotUrl })
       }).catch(() => {});
     }
 
@@ -235,7 +330,7 @@ async function sendReport(btn, reportType) {
     // Capture screenshot for hash/add (false_negative only — best effort)
     let dataUrl = null;
     if (reportType === 'false_negative') {
-      try { dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' }); }
+      try { dataUrl = await captureCleanScreenshot(_currentTabId, _currentTabWindowId); }
       catch (_) {}
     }
 
@@ -243,7 +338,13 @@ async function sendReport(btn, reportType) {
     const reportPromise = fetch(REPORT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, report_type: reportType, reported_by: 'popup' })
+      // Include screenshot on false_negative so /report can add hash in one call
+      body: JSON.stringify({
+        url,
+        report_type:  reportType,
+        reported_by:  'popup',
+        screenshot:   (reportType === 'false_negative' && dataUrl) ? dataUrl : '',
+      })
     });
 
     const hashPromise = reportType === 'false_negative' && dataUrl

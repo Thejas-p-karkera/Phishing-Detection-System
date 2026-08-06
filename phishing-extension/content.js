@@ -84,14 +84,14 @@ function showPopup(prediction, confidence, message, reasons) {
     ? `<div style="margin-top:12px; border-top:1px solid rgba(255,255,255,0.2); padding-top:10px;">
         <ul style="margin:0; padding:0; list-style:none; display:flex; flex-direction:column; gap:5px;">
           ${topReasons.map(r => `
-            <li style="display:flex; align-items:flex-start; gap:7px; font-size:0.83rem;
+            <li style="display:flex; align-items:flex-start; gap:7px; font-size:0.83em;
                         background:rgba(0,0,0,0.15); border-radius:7px; padding:6px 10px;">
               <span style="flex-shrink:0;">${severityIcon[r.severity] || '⚪'}</span>
               <span>${r.label}</span>
             </li>`).join('')}
         </ul>
         ${reasons.length > 3
-          ? `<p style="margin:6px 0 0; font-size:0.75rem; opacity:0.6; text-align:right;">
+          ? `<p style="margin:6px 0 0; font-size:0.75em; opacity:0.6; text-align:right;">
                +${reasons.length - 3} more — click the extension icon for details
              </p>`
           : ''}
@@ -107,21 +107,24 @@ function showPopup(prediction, confidence, message, reasons) {
     border-radius: 16px; padding: 18px;
     box-shadow: 0 20px 48px rgba(0,0,0,0.55);
     font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 16px;
+    line-height: normal;
+    box-sizing: border-box;
     color: white;
     border: 1px solid rgba(255,255,255,0.2);
   `;
 
   popup.innerHTML = `
     <div style="display:flex; align-items:flex-start; gap:12px; margin-bottom:4px;">
-      <div style="font-size:2rem; flex-shrink:0;">${titleIcon}</div>
+      <div style="font-size:2em; flex-shrink:0;">${titleIcon}</div>
       <div style="flex:1;">
-        <div style="font-size:1.2rem; font-weight:700; margin-bottom:2px;">${titleText}</div>
-        <div style="font-size:0.83rem; opacity:0.85; line-height:1.4;">${message}</div>
+        <div style="font-size:1.2em; font-weight:700; margin-bottom:2px;">${titleText}</div>
+        <div style="font-size:0.83em; opacity:0.85; line-height:1.4;">${message}</div>
       </div>
       <button id="pg-dismiss"
         style="align-self:flex-start; padding:4px 9px; background:rgba(255,255,255,0.2);
                border:none; border-radius:6px; color:white; cursor:pointer;
-               font-size:0.8rem; flex-shrink:0; line-height:1.4;">
+               font-size:0.8em; flex-shrink:0; line-height:1.4;">
         ✕
       </button>
     </div>
@@ -133,7 +136,7 @@ function showPopup(prediction, confidence, message, reasons) {
           <div style="height:100%; width:${Math.round(confidence * 100)}%;
                       background:white; border-radius:999px;"></div>
         </div>
-        <div style="font-size:0.95rem; font-weight:700; flex-shrink:0;">
+        <div style="font-size:0.95em; font-weight:700; flex-shrink:0;">
           ${Math.round(confidence * 100)}%
         </div>
       </div>
@@ -141,7 +144,7 @@ function showPopup(prediction, confidence, message, reasons) {
 
     ${reasonsHtml}
 
-    <p style="margin-top:10px; margin-bottom:0; font-size:0.72rem; opacity:0.55;
+    <p style="margin-top:10px; margin-bottom:0; font-size:0.72em; opacity:0.55;
                text-align:center; letter-spacing:0.02em;">
       Click the PhishGuard icon for full details &amp; actions
     </p>
@@ -153,6 +156,43 @@ function showPopup(prediction, confidence, message, reasons) {
   popup.querySelector('#pg-dismiss').addEventListener('click', () => popup.remove());
   setTimeout(() => { if (popup.parentNode) popup.remove(); }, autoDismiss);
 }
+
+// ─── Screenshot-safe overlay hide/restore ──────────────────────────────────────
+// Bug fix: chrome.tabs.captureVisibleTab() captures the ENTIRE rendered page,
+// including any PhishGuard overlay banner that's currently on screen. If a
+// screenshot is taken while the orange "Suspicious Site" / "Phishing Detected"
+// banner is visible, that banner gets baked into the perceptual hash. A hash
+// stored this way will only ever match OTHER screenshots that happen to have
+// the exact same banner in the exact same position — which never happens on a
+// fresh page load (the banner only appears AFTER the scan result comes back,
+// so a fresh scan's screenshot is always banner-free). This silently breaks
+// visual-clone matching for any hash captured via "Report as Phishing".
+//
+// Fix: before ANY screenshot is captured (for storing a hash OR for comparing
+// one), background.js/popup.js sends a 'hideOverlay' message first, waits for
+// the page to repaint, captures, then sends 'restoreOverlay' to bring it back.
+let _overlayHiddenForCapture = null;
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'hideOverlay') {
+    const popup = document.getElementById('phishguard-popup');
+    if (popup) {
+      _overlayHiddenForCapture = popup.style.display;
+      popup.style.display = 'none';
+    }
+    sendResponse({ hidden: !!popup });
+    return true;
+  }
+  if (request.action === 'restoreOverlay') {
+    const popup = document.getElementById('phishguard-popup');
+    if (popup && _overlayHiddenForCapture !== null) {
+      popup.style.display = _overlayHiddenForCapture;
+      _overlayHiddenForCapture = null;
+    }
+    sendResponse({ restored: !!popup });
+    return true;
+  }
+});
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 if (document.readyState === 'loading') {

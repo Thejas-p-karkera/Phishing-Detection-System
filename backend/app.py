@@ -14,11 +14,18 @@ import time
 import hashlib
 import threading
 import json
+from collections import Counter, deque          # ← ADDED for admin stats
 from dotenv import load_dotenv
 
 # Load .env file from the same directory as app.py
-# This reads GOOGLE_SAFE_BROWSING_KEY and any other secrets automatically
-# so you don't have to set environment variables manually each session.
+# This reads all secrets automatically so you don't have to set
+# environment variables manually each session.
+#
+# Required keys in .env:
+#   GOOGLE_SAFE_BROWSING_KEY=your_gsb_key
+#   VIRUSTOTAL_API_KEYS=key1,key2,...
+#   PHISHS_CREDENTIALS=pub1:sec1,pub2:sec2,...
+#     (each pair is publicKey:secretKey, comma-separated for multiple accounts)
 load_dotenv()
 
 class _TTLCache:
@@ -39,9 +46,10 @@ class _TTLCache:
     def size(self):
         with self._lock: return len(self._data)
 
-_RESULT_CACHE = _TTLCache()
-_WHOIS_CACHE  = _TTLCache()
-_VT_CACHE     = _TTLCache()
+_RESULT_CACHE  = _TTLCache()
+_WHOIS_CACHE   = _TTLCache()
+_VT_CACHE      = _TTLCache()
+_PHISHS_CACHE  = _TTLCache()   # 24-h cache for Phishs.com results
 
 import re
 import math
@@ -54,6 +62,22 @@ try:
     import whois
 except ImportError:
     whois = None
+
+# tldextract gives correct registrable-domain + suffix splitting for ANY ccTLD
+# (e.g.  mgmpu.mgmudupi.ac.in  →  subdomain='mgmpu', domain='mgmudupi', suffix='ac.in')
+# Without it, naive .split('.') treats multi-label ccTLDs like 'ac.in' as one label
+# and misidentifies the domain and subdomain count, producing noisy feature vectors
+# that push legitimate institutional sites toward "Phishing".
+# Ships an offline snapshot so it never needs live internet access at request time.
+try:
+    import tldextract as _tldextract
+    _TLDEXTRACT_AVAILABLE = True
+except ImportError:
+    _tldextract = None          # type: ignore
+    _TLDEXTRACT_AVAILABLE = False
+    print("WARNING: 'tldextract' not installed. Domain-parsing will fall back to "
+          "naive split — multi-label ccTLD sites (.ac.in, .co.uk, etc.) may be "
+          "misclassified. Run:  pip install tldextract --break-system-packages")
 
 # imagehash and Pillow — required for screenshot perceptual hashing.
 # Install with:  pip install Pillow ImageHash --break-system-packages
@@ -75,7 +99,12 @@ app = FastAPI(title="Advanced Phishing Detection API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://*/*", "http://*/*"],
+    # Only the React admin dashboard (localhost:3000) is allowed to make
+    # cross-origin requests. The browser extension bypasses CORS entirely
+    # via host_permissions in manifest.json — it does not need to be listed here.
+    # "https://*/*" and "http://*/*" have been removed — they allowed ANY website
+    # on the internet to query your API, which defeats the purpose of CORS.
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -89,8 +118,14 @@ PROGRESS_PATH = "1LExtracted.csv"
 try:
     model = joblib.load(MODEL_PATH)
     known_urls_df = pd.read_csv(PROGRESS_PATH)
+    # Normalise stored URLs the same way we normalise browser URLs at lookup time.
+    # This strips tracking params, fragments, trailing slashes — so
+    # "http://evil.com/?utm_source=bing" matches "http://evil.com" in the CSV.
     known_urls_df["url_norm"] = (
-        known_urls_df["url"].astype(str).str.strip().str.lower()
+        known_urls_df["url"].astype(str)
+        .str.strip().str.lower()
+        .str.rstrip('/')   # strip trailing slash at load time too
+        .str.split('#').str[0]  # drop fragment
     )
     known_urls = set(known_urls_df["url_norm"].tolist())
     print(f"Loaded model. Known URLs: {len(known_urls)}")
@@ -101,8 +136,91 @@ except FileNotFoundError:
     print("Model/CSV not found – known-URL shortcut disabled")
 
 
+def _cache_key(url: str) -> str:
+    """
+    Compute the result-cache key: scheme + host + path ONLY (no query params).
+
+    Why strip all query params for caching (but not for known-URL lookup):
+      • Ad networks (Bing, Google) append unique tracking params on every click:
+        utm_source, utm_medium, campaignid, language, matchtype, network, etc.
+        Many of these are NOT in the TRACKING removal set, so _normalise_for_lookup
+        leaves them in — causing a different cache key every single visit.
+      • The ML model, WHOIS, and content features all operate on the page
+        at scheme://host/path.  Query parameters never change what the page
+        looks like to our detector.
+      • Result: using scheme+host+path as the key guarantees a cache hit on
+        any second visit to the same page regardless of which ad params are present.
+
+    _normalise_for_lookup() is still used for known-URL matching (training CSV)
+    because the CSV URLs may legitimately include query params that distinguish
+    different pages on the same domain.
+    """
+    try:
+        from urllib.parse import urlparse
+        p    = urlparse(url.strip().lower())
+        path = p.path.rstrip('/') or '/'
+        return f"{p.scheme}://{p.netloc}{path}"
+    except Exception:
+        return url.strip().lower()
+
+
 class URLRequest(BaseModel):
     url: str
+    # True only when the user explicitly clicks "Scan Current Page" in the
+    # popup. False (default) means this came from the extension's automatic
+    # background scan on page load/navigation. Used to suppress logging of
+    # routine "trusted" verdicts from auto-scan (see /predict Tier 1 below) —
+    # every page load/refresh of a trusted site was otherwise spamming
+    # Total Scans and Scan History with entries the user never asked for.
+    manual: bool = False
+
+
+def _normalise_for_lookup(url: str) -> str:
+    """
+    Normalise a URL to a canonical form for known-URL and feed matching.
+
+    URLs in the training CSV are plain bare URLs (no UTM params, no fragment,
+    no trailing slash variations). But browsers send full URLs with tracking
+    params (utm_source, fbclid, gclid etc.) and trailing slashes. Without
+    normalisation, `http://evil.com` in the CSV never matches
+    `http://evil.com/?utm_source=bing&utm_medium=cpc` from the browser.
+
+    Steps:
+      1. Lowercase the entire URL
+      2. Strip scheme-normalised trailing slash from path ("/")
+      3. Remove the fragment (#...) entirely
+      4. Drop common tracking query parameters
+         (utm_*, fbclid, gclid, msclkid, mc_*, ref, referrer, etc.)
+      5. If all query params were tracking-only, drop the "?" too
+    """
+    try:
+        from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+        p = urlparse(url.strip().lower())
+
+        # Remove tracking-only query params — keep non-tracking ones
+        TRACKING = {
+            'utm_source','utm_medium','utm_campaign','utm_term','utm_content',
+            'utm_id','utm_funnel','utm_match_type','fbclid','gclid','msclkid',
+            'mc_cid','mc_eid','ref','referrer','source','partner','id',
+            'adgroupid','adid','campaignid','ad_id','ad_set_id','adset_id',
+        }
+        params = parse_qs(p.query, keep_blank_values=True)
+        filtered = {k: v for k, v in params.items() if k not in TRACKING}
+        new_query = urlencode(filtered, doseq=True)
+
+        # Normalise path: collapse // and strip trailing slash (except bare /)
+        path = p.path or '/'
+        while '//' in path:
+            path = path.replace('//', '/')
+        if path != '/' and path.endswith('/'):
+            path = path.rstrip('/')
+
+        normalised = urlunparse((
+            p.scheme, p.netloc, path, p.params, new_query, ''  # drop fragment
+        ))
+        return normalised
+    except Exception:
+        return url.strip().lower()
 
 class ScreenshotRequest(BaseModel):
     url: str
@@ -129,7 +247,7 @@ class ScreenshotRequest(BaseModel):
 #
 # Subdomain matching: 'chat.openai.com' trusted because ends with '.openai.com'
 
-TRANCO_TOP_N     = 5000          # raise to 10000 to cover more sites
+TRANCO_TOP_N     = 50000          # raise to 10000 to cover more sites
 _TRANCO_DOMAINS: set[str] = set()
 _tranco_meta: dict = {"loaded": False, "domain_count": 0, "loaded_at": None, "error": None}
 
@@ -538,137 +656,471 @@ def check_google_safe_browsing(url: str) -> dict:
 # ======================================================================
 # === TIER 2b: VIRUSTOTAL URL REPUTATION
 # ======================================================================
-# VirusTotal scans a URL against 70+ security vendors simultaneously
-# and returns a vote count: how many flagged it as malicious/suspicious.
-#
-# Why this is more powerful than GSB alone:
-#   - GSB = Google's opinion only
-#   - VirusTotal = 70+ independent security companies voting
-#   - A site that slips past GSB might be caught by Kaspersky, BitDefender,
-#     Fortinet, ESET, etc. who are also in the VirusTotal pool
-#
-# Free tier: 500 URL lookups/day, 4 requests/minute
-# Get your API key at: https://www.virustotal.com/gui/join-us
-#
-# Trust score interpretation:
-#   malicious_votes / total_vendors × 100 = malicious percentage
-#   0%        → clean (all vendors agree safe)
-#   1–10%     → suspicious (minor flags, treat as warning)
-#   10%+      → likely malicious (override ML model to Phishing)
-#   25%+      → confirmed threat (high confidence Phishing)
+# ========== VirusTotal with API KEY ROTATION + PER‑KEY RATE LIMIT + COOLDOWN ==========
 
-VT_API_KEY = os.environ.get("VIRUSTOTAL_API_KEY", "")
-VT_API_URL  = "https://www.virustotal.com/api/v3/urls"
+VT_API_KEYS = [k.strip() for k in os.environ.get("VIRUSTOTAL_API_KEYS", "").split(",") if k.strip()]
+VT_API_URL = "https://www.virustotal.com/api/v3/urls"
 
-# Thresholds — tune these to balance false positives vs false negatives
-VT_SUSPICIOUS_THRESHOLD  = 3    # ≥3 vendors flag → add warning reason
-VT_MALICIOUS_THRESHOLD   = 8    # ≥8 vendors flag → override to Phishing
+VT_SUSPICIOUS_THRESHOLD = 3
+VT_MALICIOUS_THRESHOLD = 8
+
+# Rate limit: 4 requests per minute per key (free tier)
+VT_REQUESTS_PER_WINDOW = 4
+VT_WINDOW_SECONDS = 60
+
+class VTKey:
+    def __init__(self, key):
+        self.key = key
+        self.request_times = deque()      # from collections import deque
+        self.lock = threading.Lock()
+
+    def wait_if_needed(self, max_wait: float = 5.0):
+        """
+        Block until a rate-limit slot is available, or max_wait seconds elapse.
+
+        PERF FIX: Was an infinite `while True` — when all 4 slots were used it
+        slept up to 60 s per iteration with no exit. Under rate pressure this was
+        a primary cause of 45–80 s response times (the executor shutdown(wait=True)
+        couldn't return while this thread was stuck in here).
+
+        Returns True when a slot is obtained, False when max_wait expires.
+        Returning False is safe: check_virustotal moves to the next key; if all
+        keys are exhausted it falls through to the cached-miss default —
+        identical behaviour to receiving a 429, which was already handled.
+        """
+        deadline = time.time() + max_wait
+        while True:
+            with self.lock:
+                now = time.time()
+                while self.request_times and now - self.request_times[0] >= VT_WINDOW_SECONDS:
+                    self.request_times.popleft()
+                if len(self.request_times) < VT_REQUESTS_PER_WINDOW:
+                    self.request_times.append(now)
+                    return True
+                if now >= deadline:
+                    return False          # give up; caller handles gracefully
+                wait = min(
+                    VT_WINDOW_SECONDS - (now - self.request_times[0]) + 0.1,
+                    deadline - now        # never sleep past our own deadline
+                )
+            time.sleep(max(0.1, wait))
+
+# Create key objects
+_vt_keys = [VTKey(k) for k in VT_API_KEYS]
+_vt_key_counter = 0
+_vt_key_lock = threading.Lock()
+_vt_cooldown = {}          # key -> timestamp when cooldown expires
+_vt_cooldown_lock = threading.Lock()
+
+def _get_next_vt_key():
+    """Round‑robin selection of next VT key, skipping keys that are in cooldown."""
+    if not _vt_keys:
+        return None
+    with _vt_key_lock, _vt_cooldown_lock:
+        global _vt_key_counter
+        for _ in range(len(_vt_keys)):
+            key_obj = _vt_keys[_vt_key_counter % len(_vt_keys)]
+            _vt_key_counter += 1
+            # Skip if key is in cooldown (from a recent 429)
+            if key_obj.key in _vt_cooldown:
+                if time.time() < _vt_cooldown[key_obj.key]:
+                    continue
+                else:
+                    del _vt_cooldown[key_obj.key]
+            return key_obj
+    return None
+
+def _mark_vt_cooldown(key, seconds=60):
+    """Mark a key as rate‑limited, do not use it for `seconds`."""
+    with _vt_cooldown_lock:
+        _vt_cooldown[key] = time.time() + seconds
+        print(f"[VT] Key ...{key[-4:]} is now in cooldown for {seconds}s")
+
+def _remove_vt_key(key_obj):
+    """Permanently remove an invalid key from the pool."""
+    with _vt_key_lock:
+        if key_obj in _vt_keys:
+            _vt_keys.remove(key_obj)
+            print(f"[VT] Removed invalid key ...{key_obj.key[-4:]}")
 
 def _vt_parse_stats(stats: dict) -> dict:
-    """Parse VirusTotal stats dict into our standard result format."""
-    malicious  = stats.get("malicious", 0)
+    malicious = stats.get("malicious", 0)
     suspicious = stats.get("suspicious", 0)
-    harmless   = stats.get("harmless", 0)
+    harmless = stats.get("harmless", 0)
     undetected = stats.get("undetected", 0)
-    total      = malicious + suspicious + harmless + undetected
-    # Trust score: malicious vendors count full weight, suspicious count 0.7 weight.
-    # Previously suspicious counted only 0.5 — too lenient.
-    # A site with 10/100 suspicious vendors now gets trust ~93 (was ~95).
-    # A site with 10/100 malicious vendors gets trust ~90.
-    score      = (malicious + suspicious * 0.7) / total if total > 0 else 0.0
-    trust      = max(0, int(100 - score * 100))
-    verdict    = ("malicious"  if malicious  >= VT_MALICIOUS_THRESHOLD  else
-                  "suspicious" if (malicious >= VT_SUSPICIOUS_THRESHOLD or
-                                   suspicious >= VT_SUSPICIOUS_THRESHOLD) else "clean")
+    total = malicious + suspicious + harmless + undetected
+    score = (malicious + suspicious * 0.7) / total if total > 0 else 0.0
+    trust = max(0, int(100 - score * 100))
+    verdict = ("malicious" if malicious >= VT_MALICIOUS_THRESHOLD else
+               "suspicious" if (malicious >= VT_SUSPICIOUS_THRESHOLD or
+                                suspicious >= VT_SUSPICIOUS_THRESHOLD) else "clean")
     return {
-        "checked":     True,
-        "malicious":   malicious,  "suspicious": suspicious,
-        "harmless":    harmless,   "total":      total,
-        "score":       score,      "trust_score": trust,
-        "verdict":     verdict,    "source":     "virustotal",
+        "checked": True,
+        "malicious": malicious,
+        "suspicious": suspicious,
+        "harmless": harmless,
+        "total": total,
+        "score": score,
+        "trust_score": trust,
+        "verdict": verdict,
+        "source": "virustotal",
     }
 
-
 def check_virustotal(url: str) -> dict:
-    """
-    Query VirusTotal with a three-stage speed strategy:
-
-    Stage 1 — In-memory cache (~0ms)
-        If we scanned this URL in the last hour, return immediately.
-
-    Stage 2 — Existing VT analysis (~0.5s)
-        VT stores every URL it has ever scanned.  Most URLs (especially
-        popular or previously-reported ones) already have a result.
-        GET /urls/{id} returns it instantly — no submission, no polling.
-        URL id = base64url(url) without padding.
-
-    Stage 3 — Submit + fast poll (~2-4s)
-        Only for truly new URLs.  Poll every 0.8s (was 2s) with max
-        3 attempts (was 4), capping VT wait at ~2.4s instead of ~8s.
-    """
     _VT_SKIP = {"checked": False, "source": "vt_skipped",
                 "malicious": 0, "suspicious": 0, "harmless": 0,
                 "total": 0, "score": 0.0, "trust_score": -1, "verdict": "unknown"}
-    _VT_ERR  = {**_VT_SKIP, "source": "vt_error"}
+    _VT_ERR = {**_VT_SKIP, "source": "vt_error"}
 
-    if not VT_API_KEY:
+    if not _vt_keys:
         return _VT_SKIP
 
-    headers = {"x-apikey": VT_API_KEY}
-
-    # ── Stage 1: in-memory cache ──────────────────────────────────────────────
     cache_key = hashlib.sha256(url.encode()).hexdigest()
     cached = _VT_CACHE.get(cache_key)
     if cached is not None:
-        print(f"[VT] Cache hit for {url!r}")
         return cached
 
-    try:
-        # ── Stage 2: check if VT already has this URL ─────────────────────────
-        # VT URL id = base64url(url) stripped of "=" padding
-        import base64 as _b64
-        url_id = _b64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
-        existing = requests.get(
-            f"https://www.virustotal.com/api/v3/urls/{url_id}",
-            headers=headers, timeout=4
-        )
-        if existing.status_code == 200:
-            attrs = existing.json().get("data", {}).get("attributes", {})
-            stats = attrs.get("last_analysis_stats")
-            if stats:
-                result = _vt_parse_stats(stats)
-                _VT_CACHE.set(cache_key, result, ttl=86400)  # 24h
-                print(f"[VT] Existing result for {url!r}: trust={result['trust_score']}/100")
-                return result
+    # Try each key in round‑robin order, respecting cooldown and rate limits
+    for _ in range(len(_vt_keys) * 3):   # extra attempts for cooldown
+        key_obj = _get_next_vt_key()
+        if not key_obj:
+            break
 
-        # ── Stage 3: submit + fast poll (new/unknown URL) ─────────────────────
-        submit = requests.post(VT_API_URL, headers=headers,
-                               data={"url": url}, timeout=6)
-        if submit.status_code not in (200, 201):
-            raise RuntimeError(f"VT submit HTTP {submit.status_code}")
+        # Wait for this key's rate limit slot (successful requests only)
+        key_obj.wait_if_needed()
 
-        analysis_id = submit.json()["data"]["id"]
-
-        for attempt in range(3):          # was range(4)
-            time.sleep(0.8)               # was 2s — total max wait 2.4s vs 8s
-            poll = requests.get(
-                f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
+        headers = {"x-apikey": key_obj.key}
+        try:
+            import base64 as _b64
+            url_id = _b64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+            # Check if VT already has this URL
+            existing = requests.get(
+                f"https://www.virustotal.com/api/v3/urls/{url_id}",
                 headers=headers, timeout=4
             )
-            if poll.status_code != 200:
+            if existing.status_code == 200:
+                attrs = existing.json().get("data", {}).get("attributes", {})
+                stats = attrs.get("last_analysis_stats")
+                if stats:
+                    result = _vt_parse_stats(stats)
+                    _VT_CACHE.set(cache_key, result, ttl=86400)
+                    return result
+            elif existing.status_code == 429:
+                _mark_vt_cooldown(key_obj.key)
                 continue
-            poll_data = poll.json()
-            if poll_data.get("data", {}).get("attributes", {}).get("status") == "completed":
-                result = _vt_parse_stats(poll_data["data"]["attributes"]["stats"])
-                _VT_CACHE.set(cache_key, result, ttl=86400)  # 24h
-                print(f"[VT] Fresh scan {url!r}: trust={result['trust_score']}/100 (attempt {attempt+1})")
-                return result
+            elif existing.status_code == 401:
+                _remove_vt_key(key_obj)
+                continue
+            elif not existing.ok:
+                continue   # other error, try next key
 
-        raise RuntimeError("Analysis did not complete in 2.4s")
+            # Submit new URL for analysis
+            submit = requests.post(VT_API_URL, headers=headers, data={"url": url}, timeout=6)
+            if submit.status_code == 429:
+                _mark_vt_cooldown(key_obj.key)
+                continue
+            if submit.status_code == 401:
+                _remove_vt_key(key_obj)
+                continue
+            if submit.status_code not in (200, 201):
+                continue
 
+            analysis_id = submit.json()["data"]["id"]
+
+            # Poll for completion (max 3 attempts)
+            # PERF: Reduced from 0.8s to 0.5s per poll — saves 0.9s total
+            # (3 × 0.5 = 1.5s vs 3 × 0.8 = 2.4s). VT analysis typically
+            # completes within 1-2s; polling sooner catches it faster.
+            for _ in range(3):
+                time.sleep(0.5)
+                poll = requests.get(
+                    f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
+                    headers=headers, timeout=4
+                )
+                if poll.status_code == 429:
+                    _mark_vt_cooldown(key_obj.key)
+                    break   # try another key
+                if poll.status_code == 200:
+                    poll_data = poll.json()
+                    if poll_data.get("data", {}).get("attributes", {}).get("status") == "completed":
+                        result = _vt_parse_stats(poll_data["data"]["attributes"]["stats"])
+                        _VT_CACHE.set(cache_key, result, ttl=86400)
+                        return result
+            # If we get here, this key failed to complete – try next key
+        except Exception as e:
+            print(f"[VT] Error with key ...{key_obj.key[-4:]}: {e}")
+            continue
+
+    # All keys exhausted or all failed
+    if not _vt_keys:
+        print("[VT] All API keys have been exhausted or invalidated.")
+    return _VT_ERR
+
+
+# ======================================================================
+# === TIER 2c: PHISHS.COM URL REPUTATION  (CONFIDENTIAL — not exposed to UI)
+# ======================================================================
+# Phishs.com is used as a silent backend signal.
+# Its verdict is NEVER surfaced to the frontend or extension popup.
+# When it overrides to Phishing, the reason shown to the user is:
+#   "URL matches known phishing patterns and flagged by threat intelligence"
+#
+# Key rotation follows the same per-key sliding-window approach used in
+# evaluate.py: each key gets at most PHISHS_RATE_LIMIT calls per
+# PHISHS_RATE_WINDOW seconds.  Keys are round-robined; invalid keys are
+# removed permanently; rate-limited keys are skipped for that call.
+#
+# Team IDs are fetched once at startup (one API call per credential pair).
+#
+# Credentials are read from .env:
+#   PHISHS_CREDENTIALS=pub1:sec1,pub2:sec2,...
+
+PHISHS_RATE_LIMIT  = 5    # calls per key per window
+PHISHS_RATE_WINDOW = 70   # seconds (slightly above 60 for safety)
+PHISHS_TIMEOUT     = 6    # seconds per HTTP call
+
+class PhishsKey:
+    """One Phishs.com credential pair with its own sliding-window rate limiter."""
+    def __init__(self, public_key: str, secret_key: str):
+        self.public_key = public_key
+        self.secret_key = secret_key
+        self.team_id    = None          # filled at startup
+        self.call_times = deque()       # timestamps of recent successful slots
+        self.lock       = threading.Lock()
+
+    def wait_and_record(self, max_wait: float = 5.0) -> bool:
+        """
+        Block until a rate-limit slot is available, then record the call.
+
+        PERF FIX: Was an infinite `while True` — same root cause as VTKey.
+        wait_if_needed(). Returning False is safe: check_phishs moves to the
+        next key or falls through to the cached-miss default.
+
+        Returns True when a slot was obtained, False when max_wait expires.
+        """
+        deadline = time.time() + max_wait
+        while True:
+            with self.lock:
+                now = time.time()
+                while self.call_times and now - self.call_times[0] >= PHISHS_RATE_WINDOW:
+                    self.call_times.popleft()
+                if len(self.call_times) < PHISHS_RATE_LIMIT:
+                    self.call_times.append(now)
+                    return True
+                if now >= deadline:
+                    return False          # give up; caller handles gracefully
+                wait = min(
+                    PHISHS_RATE_WINDOW - (now - self.call_times[0]) + 0.1,
+                    deadline - now
+                )
+            time.sleep(max(0.1, wait))
+
+    def __repr__(self):
+        return f"PhishsKey(public={self.public_key[:8]}...)"
+
+
+# ── Key pool (populated at startup) ──────────────────────────────────────────
+_phishs_keys: list = []
+_phishs_key_counter = 0
+_phishs_key_lock    = threading.Lock()
+
+
+def _fetch_phishs_team_id(public_key: str, secret_key: str):
+    """
+    Fetch the first team ID for a Phishs.com credential pair.
+    Returns (team_id, error_string).  Called once per key at startup.
+    """
+    try:
+        r = requests.post(
+            "https://api.phishs.com/v1/entity/team/list",
+            json={},
+            headers={
+                "Content-Type": "application/json",
+                "Public-Key":   public_key,
+                "Secret-Key":   secret_key,
+            },
+            timeout=PHISHS_TIMEOUT,
+        )
+        if not r.ok:
+            return None, f"HTTP {r.status_code}"
+        teams = r.json().get("teams", [])
+        if not teams:
+            return None, "No teams in response"
+        return teams[0]["id"], None
     except Exception as e:
-        print(f"[VT] Error for {url!r}: {e}")
-        return _VT_ERR
+        return None, str(e)
+
+
+def _init_phishs_keys() -> None:
+    """
+    Parse PHISHS_CREDENTIALS from .env, fetch team IDs, and populate
+    the global _phishs_keys pool.  Called once at module load time.
+
+    .env format:
+        PHISHS_CREDENTIALS=pub1:sec1,pub2:sec2,...
+    """
+    global _phishs_keys
+    raw = os.environ.get("PHISHS_CREDENTIALS", "").strip()
+    if not raw:
+        print("[PHISHS] No credentials found in PHISHS_CREDENTIALS env var — Phishs.com disabled.")
+        return
+
+    pairs = []
+    for part in raw.split(","):
+        part = part.strip()
+        if ":" in part:
+            pub, sec = part.split(":", 1)
+            pairs.append((pub.strip(), sec.strip()))
+
+    if not pairs:
+        print("[PHISHS] PHISHS_CREDENTIALS found but could not parse any pub:sec pairs.")
+        return
+
+    usable = []
+    for pub, sec in pairs:
+        team_id, err = _fetch_phishs_team_id(pub, sec)
+        if team_id:
+            key_obj         = PhishsKey(pub, sec)
+            key_obj.team_id = team_id
+            usable.append(key_obj)
+            print(f"[PHISHS] Key {pub[:8]}... → team {team_id}  ✓")
+        else:
+            print(f"[PHISHS] Key {pub[:8]}... failed: {err}  ✗")
+
+    _phishs_keys = usable
+    if usable:
+        print(f"[PHISHS] {len(usable)} usable key(s) loaded.")
+    else:
+        print("[PHISHS] No usable Phishs.com keys — Phishs.com layer disabled.")
+
+
+# Initialise at module load (same moment the model and Tranco list load)
+_init_phishs_keys()
+
+
+def _get_next_phishs_key():
+    """Round-robin selection across the live key pool."""
+    if not _phishs_keys:
+        return None
+    with _phishs_key_lock:
+        global _phishs_key_counter
+        key = _phishs_keys[_phishs_key_counter % len(_phishs_keys)]
+        _phishs_key_counter += 1
+        return key
+
+
+def check_phishs(url: str) -> dict:
+    """
+    Query Phishs.com for the given URL using round-robin key rotation and
+    per-key sliding-window rate limiting (identical to evaluate.py logic).
+
+    Returns:
+        { "verdict": 1 | 0 | -1, "url_status": int | None }
+
+        verdict  1  → Phishs says Phishing
+        verdict  0  → Phishs says Legitimate
+        verdict -1  → error / unknown / exhausted
+        verdict -2  → Phishs disabled (no keys)
+
+    Results are cached for 24 h (same TTL as VT and the result cache).
+    rescan=False  →  re-use Phishs' own cached analysis for this URL.
+    """
+    _PHISHS_SKIP = {"verdict": -2, "url_status": None}
+    _PHISHS_ERR  = {"verdict": -1, "url_status": None}
+
+    if not _phishs_keys:
+        return _PHISHS_SKIP
+
+    # 24-h cache: avoid hitting the API for the same URL repeatedly
+    cache_key = hashlib.sha256(url.encode()).hexdigest()
+    cached = _PHISHS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Try each key in round-robin order
+    for _ in range(len(_phishs_keys) * 2):
+        key_obj = _get_next_phishs_key()
+        if not key_obj:
+            break
+
+        # Per-key rate limit — blocks if this key has hit its window cap
+        key_obj.wait_and_record()
+
+        try:
+            resp = requests.post(
+                "https://api.phishs.com/v1/scan/url",
+                json={
+                    "teamId": key_obj.team_id,
+                    "url":    url,
+                    "rescan": True,    # force fresh scan for accurate results
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "Public-Key":   key_obj.public_key,
+                    "Secret-Key":   key_obj.secret_key,
+                },
+                timeout=PHISHS_TIMEOUT,
+            )
+        except requests.exceptions.Timeout:
+            # Timeout = Phishs API is unreachable for this URL right now.
+            # No point retrying other keys -- they hit the same endpoint.
+            # Cache with very short TTL (5 min) so next scan retries fresh.
+            print(f"[PHISHS] Timeout for {url!r} -- skipping remaining keys")
+            _PHISHS_CACHE.set(cache_key, _PHISHS_ERR, ttl=300)  # 5 min TTL
+            return _PHISHS_ERR
+        except Exception as e:
+            print(f"[PHISHS] Request error for {url!r}: {e}")
+            continue
+
+        if resp.status_code == 429:
+            # This key is momentarily rate-limited — skip to the next one
+            continue
+
+        if resp.status_code in (401, 403):
+            # Invalid / revoked key — remove permanently
+            with _phishs_key_lock:
+                if key_obj in _phishs_keys:
+                    _phishs_keys.remove(key_obj)
+                    print(f"[PHISHS] Removed invalid key {key_obj.public_key[:8]}...")
+            continue
+
+        if resp.status_code == 400:
+            # 400 = URL rejected by Phishs API (malformed/unsupported).
+            # Every key returns the same 400 for this URL - no point retrying.
+            # Cache with short TTL (1h) so next scan retries fresh.
+            print(f"[PHISHS] HTTP 400 (URL rejected) for {url!r} -- skipping all keys")
+            _PHISHS_CACHE.set(cache_key, _PHISHS_ERR, ttl=3600)  # 1h TTL
+            return _PHISHS_ERR
+
+        if not resp.ok:
+            print(f"[PHISHS] HTTP {resp.status_code} for {url!r}")
+            continue
+
+        try:
+            data       = resp.json()
+            url_status = data.get("urlStatus")
+            if url_status is None:
+                continue
+            status_code = url_status.get("status")
+            if status_code == 1:
+                result = {"verdict": 1, "url_status": status_code}
+                _PHISHS_CACHE.set(cache_key, result, ttl=86400)  # 24h for definitive
+            elif status_code == 0:
+                result = {"verdict": 0, "url_status": status_code}
+                _PHISHS_CACHE.set(cache_key, result, ttl=86400)  # 24h for definitive
+            else:
+                # Unknown status -- cache briefly so we retry soon
+                result = {"verdict": -1, "url_status": status_code}
+                _PHISHS_CACHE.set(cache_key, result, ttl=300)    # 5 min only
+            return result
+
+        except Exception as e:
+            print(f"[PHISHS] Parse error for {url!r}: {e}")
+            continue
+
+    if not _phishs_keys:
+        print("[PHISHS] All API keys have been invalidated or exhausted.")
+    return _PHISHS_ERR
 
 
 # ======================================================================
@@ -697,35 +1149,67 @@ _HASH_DB_PATH = os.path.join(os.path.dirname(__file__), "phishing_hashes.json")
 _HASH_DB_LOCK = threading.Lock()
 
 def _load_hash_db() -> tuple:
-    """Load known phishing hashes AND url→hash map from JSON file."""
+    """
+    Load known phishing hashes, url→hash map, AND insertion order from JSON.
+    Returns: (hashes_set, url_to_hash_dict, ordered_hashes_list)
+
+    Orphan policy: hashes with no URL mapping are silently dropped on load.
+    This cleans up pre-existing "Unknown origin" entries automatically —
+    they are absent from the in-memory set and removed from disk the next
+    time _save_hash_db() is called.
+    """
     if not os.path.exists(_HASH_DB_PATH):
         print("[HASH-DB] phishing_hashes.json not found — starting with empty database.")
-        return set(), {}
+        return set(), {}, []
     try:
         with open(_HASH_DB_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        hashes     = set(data.get("hashes", []))
-        url_map    = data.get("url_hash_map", {})
+        ordered_raw = data.get("hashes_ordered", data.get("hashes", []))
+        url_map     = data.get("url_hash_map", {})
+
+        # Build set of hashes that have a URL mapping (invert url_map values)
+        mapped_hashes = set(url_map.values())
+
+        # Keep only mapped hashes — drop orphans silently
+        orphan_count = sum(1 for h in ordered_raw if h not in mapped_hashes)
+        ordered      = [h for h in ordered_raw if h in mapped_hashes]
+        hashes       = set(ordered)
+
+        if orphan_count:
+            print(f"[HASH-DB] Dropped {orphan_count} orphaned hash(es) with no URL mapping.")
         print(f"[HASH-DB] Loaded {len(hashes)} hashes, {len(url_map)} URL mappings from disk.")
-        return hashes, url_map
+        return hashes, url_map, list(ordered)
     except Exception as e:
         print(f"[HASH-DB] Failed to load hash database: {e} — starting empty.")
-        return set(), {}
+        return set(), {}, []
 
-def _save_hash_db(hashes: set, url_map: dict) -> None:
-    """Persist hashes AND url→hash map to JSON (thread-safe)."""
+def _save_hash_db(hashes: set, url_map: dict, ordered: list) -> None:
+    """
+    Persist hashes, url→hash map, and insertion order to JSON (thread-safe).
+
+    Orphan policy: only hashes that have a URL mapping are written to disk.
+    Any hash without a corresponding entry in url_map is silently excluded,
+    so "Unknown origin" entries can never accumulate in the JSON file.
+    """
     try:
         with _HASH_DB_LOCK:
+            # Build the set of hashes that are referenced by the url_map
+            mapped_hashes = set(url_map.values())
+
+            # Filter both the ordered list and the url_map to exclude orphans
+            clean_ordered = [h for h in ordered  if h in mapped_hashes]
+            clean_url_map = {url: h for url, h in url_map.items() if h in hashes}
+
             with open(_HASH_DB_PATH, "w", encoding="utf-8") as f:
                 json.dump({
-                    "hashes":       sorted(hashes),
-                    "url_hash_map": url_map,
+                    "hashes_ordered": clean_ordered,
+                    "url_hash_map":   clean_url_map,
                 }, f, indent=2)
     except Exception as e:
         print(f"[HASH-DB] Failed to save hash database: {e}")
 
 # Load into memory at module import time
-KNOWN_PHISHING_HASHES, _URL_TO_HASH = _load_hash_db()
+KNOWN_PHISHING_HASHES, _URL_TO_HASH, _HASH_INSERT_ORDER = _load_hash_db()
 
 def compute_screenshot_hash(b64_png: str) -> Optional[str]:
     """Decode base64 PNG and return its perceptual hash string, or None on failure."""
@@ -747,23 +1231,41 @@ def is_visual_clone(b64_png: str) -> dict:
     """
     current_hash_str = compute_screenshot_hash(b64_png)
     if not current_hash_str:
+        print("[CLONE-CHECK] compute_screenshot_hash returned None — "
+              "imagehash/Pillow missing or image decode failed.")
         return {"is_clone": False, "matched_hash": None, "current_hash": None}
+
+    print(f"[CLONE-CHECK] current_hash={current_hash_str}  "
+          f"db_size={len(KNOWN_PHISHING_HASHES)}  threshold={PHASH_SIMILARITY_THRESHOLD}")
 
     try:
         current_hash = imagehash.hex_to_hash(current_hash_str)
+        if not KNOWN_PHISHING_HASHES:
+            print("[CLONE-CHECK] KNOWN_PHISHING_HASHES is EMPTY — nothing to compare against.")
+        best_dist = None
+        best_hash = None
         for known_str in KNOWN_PHISHING_HASHES:
             try:
                 known_hash = imagehash.hex_to_hash(known_str)
-                if (current_hash - known_hash) <= PHASH_SIMILARITY_THRESHOLD:
+                dist = current_hash - known_hash
+                if best_dist is None or dist < best_dist:
+                    best_dist, best_hash = dist, known_str
+                print(f"[CLONE-CHECK]   vs known={known_str}  distance={dist}")
+                if dist <= PHASH_SIMILARITY_THRESHOLD:
+                    print(f"[CLONE-CHECK] MATCH — distance {dist} <= threshold {PHASH_SIMILARITY_THRESHOLD}")
                     return {
                         "is_clone":     True,
                         "matched_hash": known_str,
                         "current_hash": current_hash_str,
                     }
-            except Exception:
+            except Exception as e:
+                print(f"[CLONE-CHECK]   compare error for known={known_str!r}: {e}")
                 continue
+        if best_dist is not None:
+            print(f"[CLONE-CHECK] NO MATCH — closest distance was {best_dist} "
+                  f"(needed <= {PHASH_SIMILARITY_THRESHOLD}) against {best_hash}")
     except Exception as e:
-        print(f"Visual clone check error: {e}")
+        print(f"[CLONE-CHECK] Visual clone check error: {e}")
 
     return {"is_clone": False, "matched_hash": None, "current_hash": current_hash_str}
 
@@ -882,7 +1384,12 @@ FEATURE_META: dict[str, tuple[str, object, str]] = {
     "title_is_generic":    ("Page title is generic (Welcome, Login, Home…)",
                             lambda v: v == 1, _SEVERITY_LOW),
     "title_domain_match":  ("Page title does not match the domain name",
-                            lambda v: v == 0, _SEVERITY_MEDIUM),
+                            lambda v: v == 0, _SEVERITY_LOW),
+                            # Downgraded MEDIUM→LOW: even after improved fuzzy matching,
+                            # many legitimate institutional sites use full organisation
+                            # names in titles that bear no substring relation to the
+                            # domain label.  High false-positive rate makes this
+                            # unsuitable as a MEDIUM-weight reason.
     "num_forms":           ("Unusually many forms on a single page",
                             lambda v: v > 3, _SEVERITY_MEDIUM),
     "script_iframe_ratio": ("Disproportionate number of scripts relative to iframes",
@@ -1007,7 +1514,7 @@ def _tokens(url):
 
 def _entropy(s):
     if not s: return 0.0
-    from collections import Counter
+    from collections import Counter, deque
     c = Counter(s)
     n = len(s)
     return -sum((v/n)*math.log2(v/n) for v in c.values() if v > 0)
@@ -1023,11 +1530,29 @@ def _whois_record(domain):
     if cached is not None:
         return cached   # instant — no network call
     try:
-        rec = whois.whois(domain)
-        _WHOIS_CACHE.set(domain, rec, ttl=86400)  # cache 24 hours
+        # PERF FIX: whois.whois() makes raw TCP connections with NO built-in
+        # timeout. Slow or unresponsive WHOIS servers hang for 30–60 s, which
+        # (combined with the executor shutdown(wait=True) bug) was a primary
+        # source of the 45–80 s delays.
+        #
+        # Wrap the call in a daemon thread capped at 6 seconds.  socket.
+        # setdefaulttimeout() is not thread-safe so we use a thread+join instead.
+        # The daemon thread is lightweight; if it outlives the 6 s window it
+        # continues quietly in the background and we simply discard its result.
+        _res: list = [None]
+        def _do_whois():
+            try:
+                _res[0] = whois.whois(domain)
+            except Exception:
+                pass
+        _t = threading.Thread(target=_do_whois, daemon=True)
+        _t.start()
+        _t.join(timeout=6)          # hard 6-second cap
+        rec = _res[0]               # None if timed out or exception
+        _WHOIS_CACHE.set(domain, rec, ttl=86400)  # cache 24 hours (even None)
         return rec
     except Exception:
-        _WHOIS_CACHE.set(domain, None, ttl=86400)  # cache failure 24h too
+        _WHOIS_CACHE.set(domain, None, ttl=86400)
         return None
 
 def _normalize_whois_date(d):
@@ -1081,6 +1606,134 @@ def _fetch_whois_features(url: str) -> tuple[int, int, int]:
         privacy = -1
 
     return age, expiry, privacy
+
+
+# ======================================================================
+# === DOMAIN PARSING HELPERS (tldextract-based)
+# ======================================================================
+#
+# _tld_extract_parts(hostname) → (subdomain, domain, suffix)
+#
+# Examples (naive split vs. tldextract):
+#   mgmpu.mgmudupi.ac.in  naive → domain='ac',      subs=2  (WRONG)
+#                         tld   → domain='mgmudupi', subs=1  (CORRECT)
+#   www.google.co.uk      naive → domain='co',       subs=2  (WRONG)
+#                         tld   → domain='google',   subs=1  (CORRECT)
+#   evil.free.com         both  → domain='free',     subs=1  (same)
+#
+# Falls back to naive heuristic when tldextract is not installed.
+
+def _tld_extract_parts(hostname: str) -> tuple[str, str, str]:
+    """
+    Return (subdomain, domain, suffix) for the given hostname using
+    tldextract when available, or a best-effort naive fallback.
+
+    All three parts are lowercase strings; any may be empty.
+    """
+    if not hostname:
+        return '', '', ''
+    hostname = hostname.lower()
+    if _TLDEXTRACT_AVAILABLE:
+        try:
+            ext = _tldextract.extract(hostname)
+            return ext.subdomain, ext.domain, ext.suffix
+        except Exception:
+            pass
+    # ── Naive fallback (used only if tldextract is missing) ──────────
+    # Known multi-label ccTLD second-levels so the most common cases
+    # are at least partially correct even without the library.
+    _KNOWN_SLD = {
+        'ac','co','com','edu','gov','net','org','mil','nic','res',
+    }
+    parts = hostname.split('.')
+    if len(parts) >= 3 and parts[-2].lower() in _KNOWN_SLD:
+        # e.g. ['mgmpu','mgmudupi','ac','in'] → suffix='ac.in', domain='mgmudupi'
+        suffix    = '.'.join(parts[-2:])
+        domain    = parts[-3]
+        subdomain = '.'.join(parts[:-3])
+    elif len(parts) >= 2:
+        suffix    = parts[-1]
+        domain    = parts[-2]
+        subdomain = '.'.join(parts[:-2])
+    else:
+        suffix    = ''
+        domain    = hostname
+        subdomain = ''
+    return subdomain, domain, suffix
+
+
+# ======================================================================
+# === TIER 1.5: INSTITUTIONAL DOMAIN CONFIDENCE DAMPENER
+# ======================================================================
+#
+# Institutional registries (academic, government, military) require verified
+# organisational identity — they are almost never used for throwaway phishing.
+# Yet small institutional sites (.ac.in colleges, govt portals, school sites)
+# are frequently absent from popularity lists (Tranco / Majestic) AND have
+# many benign features that the ML model was not well-trained on (no favicon
+# in markup, title mismatch due to naive domain parsing, etc.).
+#
+# This tier does NOT bypass scanning — it acts as a confidence dampener:
+#   • ML confidence is reduced by INSTITUTIONAL_CONFIDENCE_PENALTY (default 0.20)
+#   • The effective threshold to trigger a Phishing verdict is raised by
+#     INSTITUTIONAL_THRESHOLD_RAISE (default 0.08)
+#
+# Combined effect: a confidence of 0.99 on an institutional site becomes
+# 0.79, checked against an effective threshold of 0.83 → falls through to
+# Rule 7 (below threshold) → returned as Legitimate unless VT/GSB/feed also
+# disagree.  A genuinely high-confidence phishing result (say 0.97 after
+# penalty = 0.77, threshold 0.83) also falls through.  Only truly extreme
+# scores (>= 1.03 before capping, i.e. impossible) would still fire — in
+# practice, the dampener effectively requires both ML AND an external signal
+# to confirm a Phishing verdict for institutional domains.
+
+INSTITUTIONAL_CONFIDENCE_PENALTY = 0.20   # subtract from raw ML confidence
+INSTITUTIONAL_THRESHOLD_RAISE    = 0.08   # add to CONFIDENCE_THRESHOLD
+
+# Suffix patterns that indicate institutional/government/academic registrations.
+# Multi-label ccTLD suffixes use the full suffix string as returned by tldextract.
+_INSTITUTIONAL_SUFFIXES: set[str] = {
+    # Generic institutional TLDs (global)
+    'edu', 'gov', 'mil', 'ac',
+    # India
+    'ac.in', 'edu.in', 'gov.in', 'mil.in', 'res.in', 'nic.in',
+    # UK
+    'ac.uk', 'gov.uk', 'mod.uk', 'nhs.uk', 'police.uk', 'sch.uk',
+    # Australia
+    'edu.au', 'gov.au', 'csiro.au', 'act.edu.au', 'nsw.edu.au',
+    # New Zealand
+    'ac.nz', 'govt.nz', 'school.nz',
+    # Other common ones
+    'edu.sg', 'gov.sg',
+    'ac.za', 'gov.za',
+    'edu.my', 'gov.my',
+    'edu.pk', 'gov.pk', 'ac.pk',
+    'edu.bd', 'gov.bd', 'ac.bd',
+    'edu.lk', 'gov.lk', 'ac.lk',
+    'ac.jp', 'go.jp',
+    'edu.cn', 'gov.cn',
+    'edu.br', 'gov.br',
+    'edu.ar', 'gob.ar',
+    'edu.mx', 'gob.mx',
+    'ac.kr', 'go.kr',
+}
+
+
+def _is_institutional_domain(url: str) -> bool:
+    """
+    Return True if the URL's hostname uses an institutional/government/
+    academic TLD suffix (as defined in _INSTITUTIONAL_SUFFIXES).
+
+    Uses tldextract for correct multi-label ccTLD handling.
+    """
+    try:
+        hostname = (urlparse(url).hostname or '').lower()
+        if not hostname:
+            return False
+        _, _, suffix = _tld_extract_parts(hostname)
+        return suffix.lower() in _INSTITUTIONAL_SUFFIXES
+    except Exception:
+        return False
 
 
 URL_FEATURE_KEYS = [
@@ -1168,15 +1821,30 @@ def extract_url_features(url: str) -> dict:
     _safe_set("num_hex_encoded",  lambda: len(re.findall(r'%[0-9A-Fa-f]{2}', u)))
     _safe_set("hex_ratio",        lambda: _ratio(lambda s: sum(c in '0123456789abcdefABCDEF' for c in s), u))
 
-    host_parts = host.split('.') if host else []
-    subs       = host_parts[:-2] if len(host_parts) >= 2 else []
+    # ── tldextract-aware domain parsing ──────────────────────────────────
+    # Replaces the old naive host.split('.') approach that broke for any
+    # multi-label ccTLD (e.g. .ac.in, .co.uk, .gov.au).
+    #
+    # Old (WRONG) for  mgmpu.mgmudupi.ac.in :
+    #   host_parts = ['mgmpu','mgmudupi','ac','in']
+    #   subs = ['mgmpu','mgmudupi']  → num_subdomains=2 (should be 1)
+    #   _domain_str() = 'ac.in'      → domain='ac' (should be 'mgmudupi')
+    #
+    # New (CORRECT):
+    #   subdomain='mgmpu', domain='mgmudupi', suffix='ac.in'
+    #   num_subdomains=1, domain_length=len('mgmudupi.ac.in')=14
+    _url_sub, _url_dom, _url_sfx = _tld_extract_parts(host)
+    subs = [s for s in _url_sub.split('.') if s]   # list of subdomain labels
 
-    _safe_set("num_subdomains",    lambda: max(len(host_parts)-2, 0))
+    _safe_set("num_subdomains",    lambda: len(subs))
     _safe_set("longest_subdomain", lambda: max((len(s) for s in subs), default=0))
-    _safe_set("tld_length",        lambda: len(host_parts[-1]) if len(host_parts)>1 else 0)
+    _safe_set("tld_length",        lambda: len(_url_sfx))
 
     def _domain_str():
-        return '.'.join(host_parts[-2:]) if len(host_parts)>=2 else host
+        # Registrable domain = domain label + suffix  (e.g. 'mgmudupi.ac.in')
+        if _url_dom and _url_sfx:
+            return f"{_url_dom}.{_url_sfx}"
+        return _url_dom or host
 
     _safe_set("domain_length", lambda: len(_domain_str()))
     _safe_set("path_depth",    lambda: len([p for p in path.split('/') if p]) if path else 0)
@@ -1192,8 +1860,13 @@ def extract_url_features(url: str) -> dict:
         except: pass
         return has_ip, valid_ip
 
-    _safe_set("has_ip",   lambda: _ip_flags()[0])
-    _safe_set("valid_ip", lambda: _ip_flags()[1])
+    # PERF: Call _ip_flags() once and unpack — previously called twice (once per feature)
+    try:
+        _ip_has, _ip_valid = _ip_flags()
+    except Exception:
+        _ip_has, _ip_valid = 0, 0
+    feats["has_ip"]   = _ip_has
+    feats["valid_ip"] = _ip_valid
     _safe_set("port_present", lambda: 1 if urlparse(u).port and urlparse(u).port not in (80,443) else 0)
     _safe_set("is_https",     lambda: 1 if urlparse(u).scheme == 'https' else 0)
     _safe_set("double_slash_path", lambda: 1 if '//' in (path or '') else 0)
@@ -1240,8 +1913,8 @@ def extract_url_features(url: str) -> dict:
     # Defaults (-1 sentinel) are already set at the top of this function.
 
     def _domain_core():
-        ds = _domain_str()
-        return ds.split('.')[0] if ds else ''
+        # Correct registrable-domain label (e.g. 'mgmudupi' not 'ac')
+        return _url_dom or (_domain_str().split('.')[0] if _domain_str() else '')
 
     def _last_path_seg_core():
         if not path: return ''
@@ -1268,8 +1941,9 @@ def extract_url_features(url: str) -> dict:
 
     _safe_set("homoglyphs_count",  lambda: sum(ord(c)>127 for c in u))
     suspicious_tlds = ['xyz','top','gq','cf','tk','ml']
-    _safe_set("suspicious_tld",    lambda: 1 if host_parts and host_parts[-1].lower() in suspicious_tlds else 0)
-    _safe_set("repeated_subdomain",lambda: 1 if len(subs)!=len(set(subs)) and len(subs)>0 else 0)
+    # Use tldextract suffix for TLD check — correct for multi-label ccTLDs
+    _safe_set("suspicious_tld",    lambda: 1 if _url_sfx.split('.')[-1].lower() in suspicious_tlds else 0)
+    _safe_set("repeated_subdomain",lambda: 1 if len(subs) != len(set(subs)) and len(subs) > 0 else 0)
 
     return feats
 
@@ -1406,44 +2080,135 @@ def extract_content_features(url: str) -> dict:
     _safe_set("input_passwords", lambda: len([i for i in inputs if i.get("type","").lower() in ("password","hidden")]))
     _safe_set("input_emails",    lambda: len([i for i in inputs if i.get("type","").lower()=="email"]))
 
-    def _ext_links(): return [a for a in links if domain and domain not in a["href"]]
+    # PERF: Compute ext_links ONCE. Previously called 3× via lambdas
+    # (external_links, external_ratio, internal_links), each doing a full
+    # list comprehension over all <a> tags.
+    try:
+        _ext_links_cached = [a for a in links if domain and domain not in a["href"]]
+    except Exception:
+        _ext_links_cached = []
 
-    _safe_set("external_links", lambda: len(_ext_links()))
-    _safe_set("external_ratio", lambda: len(_ext_links())/len(links) if links else 0)
+    _safe_set("external_links", lambda: len(_ext_links_cached))
+    _safe_set("external_ratio", lambda: len(_ext_links_cached)/len(links) if links else 0)
     _safe_set("mailto_count",   lambda: len([a for a in links if a["href"].lower().startswith("mailto:")]))
     _safe_set("js_links",       lambda: len([a for a in links if a["href"].lower().startswith("javascript:")]))
-    _safe_set("internal_links", lambda: len(links)-len(_ext_links()))
+    _safe_set("internal_links", lambda: len(links)-len(_ext_links_cached))
 
     _safe_set("num_images",      lambda: len(images))
     _safe_set("external_images", lambda: len([img for img in images if domain and domain not in img["src"]]))
 
-    def _fav(): return soup.find_all("link", rel=lambda x: x and "icon" in x.lower())
+    # PERF: Compute favicon link tags ONCE. Previously called 2× via _fav()
+    # (inside _has_favicon_fn and external_favicon), each triggering a fresh
+    # soup.find_all() traversal of the entire DOM.
+    try:
+        _fav_cached = soup.find_all("link", rel=lambda x: x and "icon" in x.lower()) if soup else []
+    except Exception:
+        _fav_cached = []
 
-    _safe_set("has_favicon",      lambda: 1 if _fav() else 0)
-    _safe_set("external_favicon", lambda: 1 if any(domain and domain not in f.get("href","") for f in _fav()) else 0)
+    def _has_favicon_fn():
+        # 1. Explicit <link rel="icon"> or <link rel="shortcut icon"> in markup
+        if _fav_cached:
+            return 1
+        # 2. Browsers automatically request /favicon.ico even without a <link> tag.
+        #    Many legitimate (especially older/simpler) sites rely solely on this
+        #    implicit fallback and have NO favicon declaration in their HTML —
+        #    this was incorrectly flagging them as suspicious.
+        try:
+            parsed = urlparse(url)
+            fav_url = f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+            # PERF: Reduced timeout 3s → 1.5s. Saves ~1.5s when favicon.ico
+            # is absent or slow to respond. Feature logic is unchanged.
+            r = requests.head(fav_url, timeout=1.5, verify=False,
+                              headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code in (200, 301, 302):
+                return 1
+        except Exception:
+            pass
+        return 0
+
+    _safe_set("has_favicon",      _has_favicon_fn)
+    _safe_set("external_favicon", lambda: 1 if any(domain and domain not in f.get("href","") for f in _fav_cached) else 0)
     _safe_set("external_scripts", lambda: len([s for s in scripts if s.get("src") and domain and domain not in s["src"]]))
 
-    def _title():
-        try: return soup.title.string.strip() if soup.title and soup.title.string else ""
-        except: return ""
+    # PERF: Compute title string ONCE. Previously _title() was called 3×
+    # (title_length, title_domain_match, title_is_generic), each accessing soup.
+    try:
+        _title_cached = soup.title.string.strip() if soup and soup.title and soup.title.string else ""
+    except Exception:
+        _title_cached = ""
 
     def _domain_core():
-        parts = domain.split('.')
-        return parts[-2] if len(parts)>=2 else domain
+        # Use tldextract to get the correct registrable-domain label.
+        # Old: parts = domain.split('.'); return parts[-2]
+        #   → for 'mgmpu.mgmudupi.ac.in' returns 'ac'  (WRONG)
+        # New: tldextract → returns 'mgmudupi'           (CORRECT)
+        hostname = domain.lower()
+        _, dom_label, _ = _tld_extract_parts(hostname)
+        return dom_label or (domain.split('.')[-2] if domain.count('.') >= 1 else domain)
 
-    _safe_set("title_length",       lambda: len(_title()))
-    _safe_set("title_domain_match", lambda: 1 if _title() and _domain_core().lower() in _title().lower() else 0)
-    _safe_set("title_is_generic",   lambda: 1 if any(w in _title().lower() for w in ['home','index','welcome','login','sign in']) else 0)
+    def _title_matches_domain():
+        """
+        Improved title→domain matching.
 
-    def _text():  return soup.get_text(separator=" ").strip()
-    def _words(): return [w for w in re.split(r'\s+', _text()) if w]
+        Old logic: strict substring  ('mgmudupi' in 'Mahatma Gandhi Memorial College')
+          → always 0 for institutional sites whose title is their full name, not their
+            domain abbreviation.
 
-    _safe_set("word_count",   lambda: len(_words()))
-    _safe_set("avg_word_len", lambda: sum(len(w) for w in _words())/len(_words()) if _words() else 0)
+        New logic (any of these counts as a match):
+          1. Domain label is a substring of the title (original check, now on correct label)
+          2. Title contains any token from the domain label of length >= 4
+             (catches 'mgm' fragments, abbreviations like 'mgmudupi' split as words)
+          3. Domain label starts with or is an acronym of the title words
+             (e.g. 'mgm' ≈ first-letters of 'Mahatma Gandhi Memorial')
+          4. Title is entirely empty → treat as 'no match' (0) regardless
+        """
+        title = _title_cached.lower()   # uses pre-computed cache
+        if not title:
+            return 0
+        core  = _domain_core().lower()
+        if not core:
+            return 0
+        # Check 1: simple substring
+        if core in title:
+            return 1
+        # Check 2: any 4+-char token within core appears in title
+        core_tokens = re.findall(r'[a-z]{4,}', core)
+        title_tokens = set(re.findall(r'[a-z]+', title))
+        if core_tokens and any(t in title_tokens for t in core_tokens):
+            return 1
+        # Check 3: core looks like an acronym of the title words
+        # (e.g. core='mgm', title_words=['mahatma','gandhi','memorial','...'])
+        title_words = re.findall(r'[a-z]+', title)
+        if len(core) >= 2 and len(title_words) >= len(core):
+            initials = ''.join(w[0] for w in title_words)
+            if core in initials:
+                return 1
+        return 0
+
+    _safe_set("title_length",       lambda: len(_title_cached))
+    _safe_set("title_domain_match", _title_matches_domain)
+    _safe_set("title_is_generic",   lambda: 1 if any(w in _title_cached.lower() for w in ['home','index','welcome','login','sign in']) else 0)
+
+    # PERF: Compute page text and word list ONCE each.
+    # _text() was called 2× (suspicious_keywords, text_entropy) — each triggers
+    # soup.get_text() which walks the entire DOM tree.
+    # _words() was called 2× (word_count, avg_word_len) — each re-runs _text()
+    # AND re.split on the full text.
+    try:
+        _text_cached  = soup.get_text(separator=" ").strip() if soup else ""
+    except Exception:
+        _text_cached  = ""
+    try:
+        _words_cached = [w for w in re.split(r'\s+', _text_cached) if w]
+    except Exception:
+        _words_cached = []
+
+    _safe_set("word_count",   lambda: len(_words_cached))
+    _safe_set("avg_word_len", lambda: sum(len(w) for w in _words_cached)/len(_words_cached) if _words_cached else 0)
 
     kw = ['login','verify','password','bank','update','account','secure','confirm','click']
-    _safe_set("suspicious_keywords", lambda: sum(_text().lower().count(k) for k in kw))
-    _safe_set("text_entropy",        lambda: _entropy(_text()))
+    _safe_set("suspicious_keywords", lambda: sum(_text_cached.lower().count(k) for k in kw))
+    _safe_set("text_entropy",        lambda: _entropy(_text_cached))
 
     _safe_set("iframe_src_external", lambda: len([i for i in iframes if i.get("src") and domain and domain not in i["src"]]))
     _safe_set("hidden_elements",     lambda: len([t for t in all_tags
@@ -1493,6 +2258,41 @@ def extract_content_features(url: str) -> dict:
 # === ENDPOINTS
 # ======================================================================
 
+def _apply_visual_clone_if_known(url: str, result: dict) -> dict:
+    """
+    If the URL path matches any entry in the pHash DB (_URL_TO_HASH), upgrade
+    the result to visual_clone regardless of what ML / feeds decided.
+
+    This is the DEFINITIVE visual-clone check.  It runs inside /predict so it
+    fires whether the result is fresh or served from the cache — and it works
+    even when /screenshot is unavailable or the pHash comparison fails due to
+    screenshot-quality differences between visits.
+
+    The check is path-based (_cache_key = scheme+host+path, no query params)
+    so it matches the same page even when ad-tracking query strings change
+    between visits.
+    """
+    req_cache_key = _cache_key(url)
+    for stored_url_key in list(_URL_TO_HASH):
+        if _cache_key(stored_url_key) == req_cache_key:
+            result = dict(result)                              # copy — never mutate in-place
+            result["status"]     = "visual_clone"
+            result["prediction"] = "Phishing"
+            result["confidence"] = max(result.get("confidence") or 0.0, 0.99)
+            result["message"]    = "Page design matches a known phishing template"
+            clone_reason = {
+                "label":    "Page visually clones a known phishing site",
+                "severity": "high",
+                "feature":  "visual_clone",
+                "value":    1,
+            }
+            existing = result.get("reasons") or []
+            if not any(r.get("feature") == "visual_clone" for r in existing):
+                result["reasons"] = [clone_reason, *existing]
+            break
+    return result
+
+
 @app.post("/predict")
 async def predict_url(request: URLRequest):
     if model is None:
@@ -1504,6 +2304,12 @@ async def predict_url(request: URLRequest):
 
     # FIX: Reject browser-internal URLs immediately
     if not is_scannable_url(url):
+        # "skipped" = non-HTTP URL submitted to the web app (chrome://, about:, etc.)
+        # The extension never reaches this path (background.js guards isScannable).
+        # BUGFIX: this is never a phishing detection — it's just "nothing to
+        # scan here" — so only log it when the user manually asked to scan.
+        if request.manual:
+            _log_scan(url, "Legitimate", 1.0, "skipped")
         return {
             "status": "skipped",
             "message": "This page type is not scannable",
@@ -1512,12 +2318,62 @@ async def predict_url(request: URLRequest):
         }
 
     # ── Tier 0: full result cache ─────────────────────────────────────────────
-    # If we've predicted this exact URL in the last hour, return instantly.
-    result_cache_key = url.lower().strip()
+    # Keyed by scheme+host+path only (_cache_key) — no query params.
+    # This ensures any second visit to the same page hits the cache even if
+    # Bing/Google Ads append different tracking params each time.
+    # known-URL lookup (Tier 2) still uses _normalise_for_lookup separately.
+    result_cache_key = _cache_key(url)
     cached_result = _RESULT_CACHE.get(result_cache_key)
     if cached_result is not None:
         print(f"[CACHE] Hit for {url!r}")
-        return cached_result
+        # NOTE: deliberately NOT calling _apply_visual_clone_if_known() here.
+        #
+        # Why: a hash can be added to _URL_TO_HASH *after* this URL's result
+        # was already cached in the same server session (e.g. the auto-scan
+        # that just ran fires off a fire-and-forget /hash/add call once it
+        # sees prediction == 'Phishing'). If every cache hit re-checked
+        # _URL_TO_HASH, a plain repeat visit within the same session would
+        # flip from "cached" to "visual_clone" a few seconds after the first
+        # scan — even though nothing about the detection method changed.
+        #
+        # The intended behaviour: visual-clone detection is the DEFINITIVE
+        # check for a genuinely FRESH scan (empty cache — e.g. right after a
+        # server restart) where the hash DB persisted across the restart but
+        # the in-memory result cache did not. Within a live session, once a
+        # result is cached, repeat visits should just serve that cached
+        # verdict and log "cached" — matching original behaviour.
+        #
+        # Log status for cache hits:
+        #   "user_reported" → preserve it (user explicitly corrected this URL)
+        #   everything else → log as "cached" (this visit was served from cache,
+        #                     regardless of how it was originally obtained)
+        cached_status = cached_result.get("status", "")
+        PRESERVE_STATUSES = {"user_reported", "known", "feed_match", "trusted"}
+        log_status = cached_status if cached_status in PRESERVE_STATUSES else "cached"
+
+        # BUGFIX: a repeat auto-scan hitting a cached "known"-Legitimate
+        # result is the same noise as a fresh known-safe hit (Patch A) —
+        # suppress it unless manual. Every other cached status (including
+        # "known"-Phishing) still logs unconditionally, same as before.
+        is_noise_verdict = (log_status == "known"
+                             and cached_result.get("prediction") == "Legitimate")
+        if request.manual or not is_noise_verdict:
+            _log_scan(url,
+                      cached_result.get("prediction", "Unknown"),
+                      cached_result.get("confidence", 0),
+                      log_status)
+        
+        # FIX: the returned JSON's own "status" must match what we just logged.
+        # Previously `return cached_result` sent back the *original* status
+        # ("predicted", "visual_clone", "feed_match", ...) forever, never the
+        # literal string "cached" — even though the scan-history log correctly
+        # said "cached". popup.js / background.js both gate the visual-clone
+        # re-application on `data.status !== 'cached'`, so that guard never
+        # actually matched on a repeat scan, and every rescan within the same
+        # session re-triggered "Visual Clone" even though nothing new happened.
+        result_to_return = dict(cached_result)
+        result_to_return["status"] = log_status
+        return result_to_return
 
     # ── Tier 1: trusted domain whitelist ─────────────────────────────────────
     # Checks Tranco Top 5000 (popularity-based) + static fallback list.
@@ -1530,7 +2386,7 @@ async def predict_url(request: URLRequest):
             if "tranco" in trust_source
             else "This site is on our verified safe list"
         )
-        return {
+        trusted_result = {
             "status":       "trusted",
             "message":      source_label,
             "prediction":   "Legitimate",
@@ -1538,12 +2394,27 @@ async def predict_url(request: URLRequest):
             "reasons":      [],
             "trust_source": trust_source,
         }
+        # Do NOT cache trusted results — every visit should log "trusted" directly.
+        # The whitelist check is O(1) set lookup, so skipping cache costs nothing.
+        #
+        # BUGFIX: only log this to Scan History / Total Scans when the user
+        # explicitly triggered a manual scan. Auto-scan fires on every page
+        # load and every refresh — for trusted sites that meant Total Scans
+        # and Scan History grew on every navigation/refresh, even though
+        # nothing noteworthy happened. Phishing/Uncertain verdicts from
+        # auto-scan are NOT affected by this — they still log normally,
+        # since those are the results the user actually needs to see.
+        if request.manual:
+            _log_scan(url, "Legitimate", 1.0, "trusted")
+        return trusted_result
 
-    url_lower = url.lower()
+    url_lower  = url.lower()
+    url_normed = _normalise_for_lookup(url)   # strips tracking params, fragment, trailing slash
 
     # Fast path: already seen in training CSV
-    if url_lower in known_urls:
-        row = known_urls_df[known_urls_df["url_norm"] == url_lower].iloc[0]
+    # Use normalised URL so browser-added UTM params don't break the match.
+    if url_normed in known_urls:
+        row = known_urls_df[known_urls_df["url_norm"] == url_normed].iloc[0]
         pred = int(row["label"])
         result = "Phishing" if pred == 1 else "Legitimate"
         message = (
@@ -1551,64 +2422,112 @@ async def predict_url(request: URLRequest):
             if result == "Phishing"
             else "This site is verified safe"
         )
-        return {
+        known_result = {
             "status":     "known",
             "message":    message,
             "prediction": result,
             "confidence": 1.0,
             "reasons":    [],
+            "gsb_checked": "skipped_known",
+            "vt":          {"checked": False, "source": "skipped_known",
+                            "malicious": 0, "suspicious": 0, "total": 0,
+                            "trust_score": -1, "verdict": "unknown"},
+            "features":   {},
         }
+        # Cache the known result — repeat visits return instantly AND still
+        # show status="known" in scan history (not "cached").
+        _RESULT_CACHE.set(result_cache_key, known_result, ttl=86400)
+        # BUGFIX: same rule as the Tier 1 trusted-domain check above — a
+        # known-SAFE site shouldn't spam Total Scans/Scan History on every
+        # auto-scan (page load/refresh). A known-PHISHING site must always
+        # log, auto-scan or not, since that's a real detection the user
+        # needs to see.
+        if request.manual or result == "Phishing":
+            _log_scan(url, result, 1.0, "known")
+        return known_result
 
-    # ── 4-way parallel extraction ─────────────────────────────────────────────
+    # ── Parallel extraction — hard 10-second wall-clock cap ───────────────────
     #
     #   Thread 1 — CPU URL features      ~10ms   pure computation
-    #   Thread 2 — WHOIS lookup          1–3s    network
+    #   Thread 2 — WHOIS lookup          1–6s    network (now capped at 6 s)
     #   Thread 3 — Content fetch/parse   1–5s    network
     #   Thread 4 — Google Safe Browsing  0.5–2s  network (independent API)
+    #   Thread 5 — VirusTotal            0.5–5s  network (multi-key rotation)
+    #   Thread 6 — Phishs.com            0.5–3s  network (silent intel layer)
     #
-    # All five run simultaneously. Total time = max of the five, not their sum.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        future_url     = executor.submit(extract_url_features, url)
-        future_whois   = executor.submit(_fetch_whois_features, url)
-        future_content = executor.submit(extract_content_features, url)
-        future_gsb     = executor.submit(check_google_safe_browsing, url)
-        future_vt      = executor.submit(check_virustotal, url)
+    # WHY THE OLD CODE WAS TAKING 45–80 SECONDS:
+    #
+    #   `with concurrent.futures.ThreadPoolExecutor(…) as executor:` calls
+    #   executor.__exit__() → shutdown(wait=True) when the block exits.
+    #   shutdown(wait=True) BLOCKS until EVERY submitted thread finishes —
+    #   even threads we already gave up on via .result(timeout=N).
+    #
+    #   The per-future timeouts (.result(timeout=3), .result(timeout=8), etc.)
+    #   only limit how long the MAIN THREAD waits for each result.  They do NOT
+    #   stop the background thread.  So after we timed out on future_whois at 3 s,
+    #   the WHOIS thread kept running whois.whois() for another 30–57 s — and the
+    #   with-block exit sat there waiting for it.  Same for VT's wait_if_needed()
+    #   (which was an infinite loop that could sleep 60 s) and Phishs.
+    #
+    # THE FIX:
+    #   1. Use concurrent.futures.wait(timeout=10) for a single hard wall-clock
+    #      deadline across ALL tasks simultaneously.
+    #   2. Call shutdown(wait=False) immediately after — this releases the
+    #      executor without blocking.  Threads that didn't finish in 10 s keep
+    #      running in the background, update their caches when done, and will
+    #      make the NEXT request to the same URL faster.
+    #   3. Collect results with _collect(): non-blocking for done futures,
+    #      returns the safe default for anything that timed out.
+    #
+    _scan_exec = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+    future_url     = _scan_exec.submit(extract_url_features, url)
+    future_whois   = _scan_exec.submit(_fetch_whois_features, url)
+    future_content = _scan_exec.submit(extract_content_features, url)
+    future_gsb     = _scan_exec.submit(check_google_safe_browsing, url)
+    future_vt      = _scan_exec.submit(check_virustotal, url)
+    future_phishs  = _scan_exec.submit(check_phishs, url)
 
-        try:
-            url_feats = future_url.result(timeout=3)   # CPU only
-        except Exception as e:
-            print(f"URL feature error for {url!r}: {e}")
-            url_feats = {k: 0 for k in URL_FEATURE_KEYS}
+    _done, _ = concurrent.futures.wait(
+        [future_url, future_whois, future_content, future_gsb, future_vt, future_phishs],
+        timeout=10          # hard 10-second cap for ALL tasks combined
+    )
+    _scan_exec.shutdown(wait=False)   # release immediately — don't block on stragglers
 
-        try:
-            age, expiry, privacy = future_whois.result(timeout=3)  # was 5s; WHOIS now cached
-        except Exception as e:
-            print(f"WHOIS error for {url!r}: {e}")
-            age, expiry, privacy = -1, -1, -1
+    def _collect(fut, default):
+        """Return the future's result if it finished; default otherwise. Never blocks."""
+        if fut in _done:
+            try:
+                return fut.result()
+            except Exception:
+                pass
+        return default
 
-        url_feats["domain_age_days"] = age
-        url_feats["days_to_expiry"]  = expiry
-        url_feats["whois_privacy"]   = privacy
+    url_feats = _collect(future_url, {k: 0 for k in URL_FEATURE_KEYS})
 
-        try:
-            content_feats = future_content.result(timeout=4)  # was 6s
-        except Exception as e:
-            print(f"Content feature error for {url!r}: {e}")
-            content_feats = {k: 0 for k in CONTENT_FEATURE_KEYS}
+    try:
+        age, expiry, privacy = _collect(future_whois, (-1, -1, -1))
+    except Exception:
+        age, expiry, privacy = -1, -1, -1
 
-        try:
-            gsb_result = future_gsb.result(timeout=4)   # was 5s
-        except Exception as e:
-            print(f"GSB error for {url!r}: {e}")
-            gsb_result = {"is_unsafe": False, "threat_type": None, "source": "gsb_error"}
+    url_feats["domain_age_days"] = age
+    url_feats["days_to_expiry"]  = expiry
+    url_feats["whois_privacy"]   = privacy
 
-        try:
-            vt_result = future_vt.result(timeout=6)   # was 15s; VT now max ~2.4s with fast poll
-        except Exception as e:
-            print(f"VT error for {url!r}: {e}")
-            vt_result = {"checked": False, "source": "vt_error",
-                         "malicious": 0, "suspicious": 0, "total": 0,
-                         "trust_score": -1, "verdict": "unknown"}
+    content_feats = _collect(future_content, {k: 0 for k in CONTENT_FEATURE_KEYS})
+
+    gsb_result = _collect(
+        future_gsb,
+        {"is_unsafe": False, "threat_type": None, "source": "gsb_error"}
+    )
+
+    vt_result = _collect(
+        future_vt,
+        {"checked": False, "source": "vt_timeout",
+         "malicious": 0, "suspicious": 0, "total": 0,
+         "trust_score": -1, "verdict": "unknown"}
+    )
+
+    phishs_result = _collect(future_phishs, {"verdict": -1, "url_status": None})
 
     all_features   = {**url_feats, **content_feats}
     feature_order  = list(URL_FEATURE_KEYS) + list(CONTENT_FEATURE_KEYS)
@@ -1621,6 +2540,44 @@ async def predict_url(request: URLRequest):
     reasons    = get_top_reasons(all_features, ml_result)
 
     # ══════════════════════════════════════════════════════════════════
+    # TIER 1.5: INSTITUTIONAL DOMAIN CONFIDENCE DAMPENER
+    # ══════════════════════════════════════════════════════════════════
+    #
+    # Institutional TLD registrations (academic, government, military) require
+    # verified organisational identity — they are almost never used for throwaway
+    # phishing.  Yet small college/government portals frequently lack features the
+    # ML model weighs heavily (favicon in markup, title verbatim matching domain),
+    # causing inflated confidence scores.
+    #
+    # This tier does NOT bypass scanning. It only dampens confidence so that
+    # genuine external signals (VT, GSB, Phishs) can still escalate to Phishing.
+    #
+    # Applied only when ML says "Phishing" — if ML already says Legitimate,
+    # no dampening is needed (we don't want to suppress correct Legitimate verdicts).
+    #
+    # Effective thresholds after dampening (defaults):
+    #   raw confidence 0.99  → 0.79  vs. effective threshold 0.83 → falls below → Legitimate
+    #   raw confidence 0.85  → 0.65  vs. effective threshold 0.83 → falls below → Legitimate
+    #   raw confidence 0.98  → 0.78  vs. effective threshold 0.83 → falls below → Legitimate
+    #   (external signals like VT/GSB/Phishs can still override to Phishing)
+    _is_institutional = _is_institutional_domain(url)
+    if _is_institutional and ml_result == "Phishing":
+        dampened_confidence = confidence - INSTITUTIONAL_CONFIDENCE_PENALTY
+        print(f"[TIER1.5] Institutional domain detected for {url!r}. "
+              f"ML confidence dampened: {confidence:.3f} → {dampened_confidence:.3f}")
+        confidence = dampened_confidence
+
+    # Safe defaults so result/message are always defined.
+    # Every branch in the engine overwrites these; defaults prevent NameError
+    # if an unexpected path is ever reached.
+    result  = ml_result
+    message = (
+        "No threats detected on this page"
+        if ml_result == "Legitimate"
+        else "This site shows multiple signs of a phishing attack"
+    )
+
+    # ══════════════════════════════════════════════════════════════════
     # SINGLE-SOURCE DECISION ENGINE
     # ══════════════════════════════════════════════════════════════════
     #
@@ -1630,18 +2587,65 @@ async def predict_url(request: URLRequest):
     #   "Legitimate" → all clear  (badge=SAFE, no notification, green popup)
     #
     # Decision order (first match wins):
-    #   Rule 1: GSB flagged                              → Phishing
-    #   Rule 2: VT ≥ 8 malicious vendors                → Phishing
-    #   Rule 3: VT suspicious (3–7) + ML missed it      → Uncertain  ← FIX: was silently Legitimate
-    #   Rule 4: ML ≥ 80% + VT trust ≥ 85               → Uncertain  (ML says bad, VT clears = conflict)
-    #   Rule 5: ML ≥ 80% + VT trust < 70               → Phishing   (both agree it's risky)
-    #   Rule 6: ML ≥ 80% + VT unchecked/middle          → Phishing   (trust ML alone)
-    #   Rule 7: ML < 80%                                → Legitimate (not confident enough)
-    #   Rule 8: ML = Legitimate                         → Legitimate
+    #   Rule 0: Phishs.com says Phishing                → Phishing   (overrides all, reason is hidden)
+    #   Rule 0: Phishs.com says Legitimate              → Reduces ML confidence by 15pp
+    #   Rule 1: GSB flagged                             → Phishing
+    #   Rule 2: VT ≥ 8 malicious vendors               → Phishing
+    #   Rule 3: VT suspicious (3-7) + ML missed it     → Uncertain
+    #   Rule 4: ML ≥ 85% + VT trust ≥ 85              → Uncertain  (ML says bad, VT clears = conflict)
+    #   Rule 5: ML ≥ 85% + VT trust < 65              → Phishing   (both agree it's risky)
+    #   Rule 6: ML ≥ 85% + VT unchecked/middle         → Phishing   (trust ML alone)
+    #   Rule 6b: ML ≥ 75% and < 85%                    → Uncertain (ML not confident enough for a hard verdict)
+    #   Rule 7: ML < 75%                               → Legitimate (not confident enough)
+    #   Rule 8: ML = Legitimate                        → Legitimate
 
-    CONFIDENCE_THRESHOLD = 0.80   # ML must be at least this confident to trigger an alert
+    # ── PhishTank / OpenPhish feed check (runs BEFORE decision engine) ──
+    # PhishTank URLs are human-verified. If matched:
+    #   - If ML also says Phishing -> override to Phishing (both agree)
+    #   - If ML says Legitimate    -> upgrade to Uncertain (human feed vs ML conflict)
+    # Running before the engine lets it influence Rule 7/8 outcomes.
+    _feed_matched = False
+    _feed_reason  = None
+    if _PHISHING_URLS:
+        _norm_url = _normalise_url(url)
+        if _norm_url in _PHISHING_URLS:
+            _feed_matched = True
+            _feed_reason  = {
+                "label":    "URL found in PhishTank / OpenPhish verified phishing database",
+                "severity": "high",
+                "feature":  "phishing_feed",
+                "value":    1,
+            }
+            reasons = [_feed_reason] + [r for r in reasons if r.get("feature") != "phishing_feed"]
+            if ml_result == "Phishing":
+                # Both ML and feed agree -> definite Phishing
+                result     = "Phishing"
+                confidence = max(confidence, 0.95)
+                message    = "This site shows multiple signs of a phishing attack"
+                _phishs_fired = True  # guard: skip Rules 1-8 (already decided)
+                print(f"[FEED] {url!r} matched feed + ML Phishing -> Phishing override")
+            else:
+                # ML says Legitimate but human feed disagrees -> Uncertain
+                result     = "Uncertain"
+                confidence = max(confidence, 0.75)
+                message    = ("This URL was reported in a verified phishing database. "
+                              "Our model considers it safe \xe2\x80\x94 proceed with caution.")
+                _phishs_fired = True  # guard: skip Rules 1-8 (already decided)
+                print(f"[FEED] {url!r} matched feed but ML says Legit -> Uncertain")
+
+    CONFIDENCE_THRESHOLD      = 0.75   # ML must be at least this confident to trigger an alert at all (Rule 7 gate)
+    HIGH_CONFIDENCE_THRESHOLD = 0.85   # ML must reach this for Rules 4/5/6 (VT cross-checks) to run
     VT_CLEAR_THRESHOLD   = 85     # VT trust ≥ this → reputation considered clean
-    VT_DANGER_THRESHOLD  = 70     # VT trust < this → reputation considered risky
+    VT_DANGER_THRESHOLD  = 65     # VT trust < this → reputation considered risky
+
+    # For institutional domains the threshold is raised further so that only
+    # very high (post-dampening) confidence still fires as Phishing.
+    # Combined with the penalty above, this makes a genuine alarm require
+    # either very high ML confidence OR corroboration from an external signal.
+    if _is_institutional:
+        CONFIDENCE_THRESHOLD = CONFIDENCE_THRESHOLD + INSTITUTIONAL_THRESHOLD_RAISE
+        print(f"[TIER1.5] Effective CONFIDENCE_THRESHOLD raised to {CONFIDENCE_THRESHOLD:.2f} "
+              f"for institutional domain {url!r}")
 
     vt_trust   = vt_result.get("trust_score", -1)
     vt_verdict = vt_result.get("verdict", "unknown")
@@ -1650,99 +2654,148 @@ async def predict_url(request: URLRequest):
     vt_total   = vt_result.get("total", 0)
     vt_checked = vt_result.get("checked", False)
 
+    # ── Phishs.com silent override (Rule 0) ──────────────
+    # Phishs verdict is applied BEFORE all other rules.
+    # It is NEVER mentioned in reasons shown to the user (kept confidential).
+    # verdict=1  -> override to Phishing (reason hidden behind generic label)
+    # verdict=0  -> reduce suspicion (lower confidence by 15pp, floor 0.50)
+    phishs_verdict = phishs_result.get("verdict", -1)
+    _phishs_fired  = False   # flag: True when Phishs overrides to Phishing
+
+    if phishs_verdict == 1:
+        # Phishs says Phishing -> override immediately, no other rules needed
+        result     = "Phishing"
+        confidence = max(confidence, 0.96)
+        message    = "This site shows multiple signs of a phishing attack"
+        # Generic reason label: reveals nothing about the source
+        phishs_reason = {
+            "label":    "URL matches known phishing patterns and flagged by threat intelligence",
+            "severity": "high",
+            "feature":  "threat_intel",
+            "value":    1,
+        }
+        reasons       = [phishs_reason] + reasons
+        _phishs_fired = True
+        print(f"[PHISHS] Override -> Phishing for {url!r}")
+
+    elif phishs_verdict == 0:
+        # Phishs says Legitimate -> reduce ML suspicion
+        # Only meaningful when ML is ABOVE threshold and would have fired.
+        # Below threshold it is already heading to Legitimate anyway.
+        if ml_result == "Phishing" and confidence >= CONFIDENCE_THRESHOLD:
+            confidence = max(CONFIDENCE_THRESHOLD - 0.01, confidence - 0.15)
+            print(f"[PHISHS] Legit signal -> ML confidence reduced to {confidence:.2f} for {url!r}")
+
     # ── Rule 1: GSB definitive blacklist ──────────────────────────────
-    if gsb_result.get("is_unsafe"):
-        threat     = gsb_result.get("threat_type", "UNKNOWN")
-        result     = "Phishing"
-        confidence = max(confidence, 0.97)
-        message    = f"Confirmed threat by Google Safe Browsing ({threat.replace('_', ' ').title()})"
-        reasons    = [
-            {"label": f"Flagged by Google Safe Browsing as {threat.replace('_', ' ').title()}",
-             "severity": "high", "feature": "gsb", "value": 1}
-        ] + reasons
+    # ── Rules 1-8: only run if Phishs has NOT already fired ──────────
+    # Wrapping all rules in "if not _phishs_fired" ensures the Phishs verdict
+    # can never be overwritten by GSB/VT/ML rules below.
+    if not _phishs_fired:
 
-    # ── Rule 2: VirusTotal multi-vendor consensus ─────────────────────
-    # Fires regardless of what ML thinks — 8+ security vendors is strong evidence.
-    elif vt_verdict == "malicious":
-        result     = "Phishing"
-        confidence = max(confidence, 0.95)
-        message    = f"Flagged as malicious by {vt_mal} of {vt_total} security vendors"
-        reasons    = [
-            {"label": f"Detected as malicious by {vt_mal}/{vt_total} security vendors (VirusTotal)",
-             "severity": "high", "feature": "virustotal", "value": vt_mal}
-        ] + reasons
+        # ── Rule 1: GSB definitive blacklist ──────────────
+        if gsb_result.get("is_unsafe"):
+            threat     = gsb_result.get("threat_type", "UNKNOWN")
+            result     = "Phishing"
+            confidence = max(confidence, 0.97)
+            message    = f"Confirmed threat by Google Safe Browsing ({threat.replace('_', ' ').title()})"
+            reasons    = [
+                {"label": f"Flagged by Google Safe Browsing as {threat.replace('_', ' ').title()}",
+                 "severity": "high", "feature": "gsb", "value": 1}
+            ] + reasons
 
-    # ── Rule 3: VT suspicious + ML didn't catch it → Uncertain ────────
-    # BUG FIX: previously this fell silently to Legitimate (Rule 7/8).
-    # If 3–7 vendors flag it as suspicious but ML says it's fine,
-    # something is off — show a warning rather than a green light.
-    elif vt_verdict == "suspicious" and vt_checked and ml_result == "Legitimate":
-        result  = "Uncertain"
-        message = (f"{vt_mal + vt_sus} security vendors flagged this site as suspicious. "
-                   f"Our model considers it legitimate — proceed with caution.")
-        reasons = [
-            {"label": f"Flagged as suspicious by {vt_mal+vt_sus} of {vt_total} security vendors",
-             "severity": "medium", "feature": "virustotal", "value": vt_mal + vt_sus}
-        ]
+        # ── Rule 2: VirusTotal multi-vendor consensus ──────
+        # Fires regardless of what ML thinks — 8+ security vendors is strong evidence.
+        elif vt_verdict == "malicious":
+            result     = "Phishing"
+            confidence = max(confidence, 0.95)
+            message    = f"Flagged as malicious by {vt_mal} of {vt_total} security vendors"
+            reasons    = [
+                {"label": f"Detected as malicious by {vt_mal}/{vt_total} security vendors (VirusTotal)",
+                 "severity": "high", "feature": "virustotal", "value": vt_mal}
+            ] + reasons
 
-    # ── Rules 4–8: ML-based decisions ─────────────────────────────────
-    elif ml_result == "Phishing":
-        if confidence >= CONFIDENCE_THRESHOLD:
+        # ── Rule 3: VT suspicious + ML missed it → Uncertain ────
+        # If 3-7 vendors flag it suspicious but ML says fine,
+        # show a warning rather than a silent green light.
+        elif vt_verdict == "suspicious" and vt_checked and ml_result == "Legitimate":
+            result  = "Uncertain"
+            message = (f"{vt_mal + vt_sus} security vendors flagged this site as suspicious. "
+                       f"Our model considers it legitimate — proceed with caution.")
+            reasons = [
+                {"label": f"Flagged as suspicious by {vt_mal+vt_sus} of {vt_total} security vendors",
+                 "severity": "medium", "feature": "virustotal", "value": vt_mal + vt_sus}
+            ]
 
-            # Rule 4: ML confident + VT clears the site → genuine conflict
-            if vt_checked and vt_trust >= VT_CLEAR_THRESHOLD:
-                result  = "Uncertain"
-                message = (f"Our model flagged this site ({round(confidence*100)}% confidence) "
-                           f"but {vt_total} security vendors rate it as trustworthy "
-                           f"(trust score {vt_trust}/100). Proceed with caution.")
+        # ── Rules 4-8: ML-based decisions ────────────────
+        elif ml_result == "Phishing":
+            if confidence >= HIGH_CONFIDENCE_THRESHOLD:
 
-            # Rule 5: ML confident + VT reputation also risky → Phishing
-            elif vt_checked and vt_trust < VT_DANGER_THRESHOLD:
-                result  = "Phishing"
-                message = "This site shows multiple signs of a phishing attack"
-                reasons = reasons + [
-                    {"label": f"VirusTotal trust score is low ({vt_trust}/100 — below safe threshold)",
-                     "severity": "medium", "feature": "virustotal", "value": vt_trust}
-                ]
+                # Rule 4: ML confident + VT clears the site → genuine conflict → Uncertain
+                # When ML is >=85% sure it is phishing AND VT trust is high,
+                # that is a real conflict. Show Uncertain so the user can decide.
+                if vt_checked and vt_trust >= VT_CLEAR_THRESHOLD:
+                    result  = "Uncertain"
+                    message = (f"Our model flagged this site ({round(confidence*100)}% confidence) "
+                               f"but {vt_total} security vendors rate it as trustworthy "
+                               f"(trust score {vt_trust}/100). Proceed with caution.")
 
-            # Rule 6: ML confident + VT not checked or trust in middle range
-            else:
-                result  = "Phishing"
-                message = "This site shows multiple signs of a phishing attack"
-                if vt_verdict == "suspicious" and vt_checked:
+                # Rule 5: ML confident + VT reputation also risky → Phishing
+                elif vt_checked and vt_trust < VT_DANGER_THRESHOLD:
+                    result  = "Phishing"
+                    message = "This site shows multiple signs of a phishing attack"
                     reasons = reasons + [
-                        {"label": f"Also flagged as suspicious by {vt_mal+vt_sus} security vendors",
-                         "severity": "medium", "feature": "virustotal", "value": vt_mal+vt_sus}
+                        {"label": f"VirusTotal trust score is low ({vt_trust}/100 — below safe threshold)",
+                         "severity": "medium", "feature": "virustotal", "value": vt_trust}
                     ]
 
+                # Rule 6: ML confident + VT not checked or trust in middle range
+                else:
+                    result  = "Phishing"
+                    message = "This site shows multiple signs of a phishing attack"
+                    if vt_verdict == "suspicious" and vt_checked:
+                        reasons = reasons + [
+                            {"label": f"Also flagged as suspicious by {vt_mal+vt_sus} security vendors",
+                             "severity": "medium", "feature": "virustotal", "value": vt_mal+vt_sus}
+                        ]
+
+            elif confidence >= CONFIDENCE_THRESHOLD:
+                # Rule 6b: ML flagged Phishing but confidence is in the 75-85% band.
+                # Not low enough to dismiss (Rule 7), but not high enough to run the
+                # VT cross-checks (Rules 4/5/6) or issue a hard Phishing verdict.
+                # `reasons` already holds the ML feature-based signals from
+                # get_top_reasons(), so the user still sees concrete explanations.
+                result  = "Uncertain"
+                message = (f"Our model flagged this site but is not highly confident "
+                           f"({round(confidence*100)}% confidence). Proceed with caution.")
+                print(f"[DECISION] Rule 6b: ML Phishing at {confidence:.2f} "
+                      f"(75-85% band) → Uncertain for {url!r}")
+
+            else:
+                # Rule 7: ML confidence below threshold
+                # Sub-rule 7a: VT also suspicious -> both signals agree -> Uncertain
+                # Sub-rule 7b: VT clean or unchecked -> not enough evidence -> Legitimate
+                if vt_verdict in ("suspicious", "malicious") and vt_checked:
+                    result  = "Uncertain"
+                    message = (f"Multiple signals suggest this site may be unsafe "
+                               f"({vt_mal+vt_sus} security vendors flagged it, model at "
+                               f"{round(confidence*100)}% confidence). Proceed with caution.")
+                    if not any(r.get("feature") == "virustotal" for r in reasons):
+                        reasons = reasons + [
+                            {"label": f"Flagged by {vt_mal+vt_sus} of {vt_total} security vendors",
+                             "severity": "medium", "feature": "virustotal", "value": vt_mal+vt_sus}
+                        ]
+                    print(f"[DECISION] ML Phishing at {confidence:.2f} + VT {vt_verdict} → Uncertain")
+                else:
+                    result  = "Legitimate"
+                    message = "No threats detected on this page"
+                    print(f"[DECISION] ML Phishing at {confidence:.2f} < {CONFIDENCE_THRESHOLD} threshold → Legitimate")
+
+        # ── Rule 8: ML says Legitimate ────────────────────
         else:
-            # Rule 7: ML confidence below threshold → not certain enough to alert
             result  = "Legitimate"
             message = "No threats detected on this page"
-            print(f"[DECISION] ML Phishing at {confidence:.2f} < {CONFIDENCE_THRESHOLD} threshold → Legitimate")
 
-    # ── Rule 8: ML says Legitimate ────────────────────────────────────
-    else:
-        result  = "Legitimate"
-        message = "No threats detected on this page"
-
-    # ── PhishTank / OpenPhish feed — weak signal only ────────────────────────
-    # The feed is NOT used as a verdict bypass (see decision comment above).
-    # If the URL appears in the feed, it is added as a medium-severity reason
-    # that feeds into the reasons list. The decision engine still runs normally
-    # using ML + GSB + VT — the feed just adds one more piece of evidence.
-    if _PHISHING_URLS:
-        norm_url = _normalise_url(url)
-        if norm_url in _PHISHING_URLS:
-            feed_reason = {
-                "label":    "URL was previously reported in PhishTank / OpenPhish phishing database",
-                "severity": "medium",
-                "feature":  "phishing_feed",
-                "value":    1,
-            }
-            # Prepend to reasons so it appears near the top
-            reasons = [feed_reason] + [r for r in reasons if r.get("feature") != "phishing_feed"]
-            print(f"[FEED] {url!r} matched phishing feed — added as signal (not bypass)")
+    # end: if not _phishs_fired
 
     # Build VT summary for frontend
     vt_summary = {
@@ -1765,8 +2818,37 @@ async def predict_url(request: URLRequest):
         "vt":          vt_summary,
         "features":    all_features,
     }
+    # BUGFIX: apply visual-clone upgrade BEFORE caching so the cached entry
+    # already carries the correct status on all future cache hits.
+    response_data = _apply_visual_clone_if_known(url, response_data)
     # Write to result cache — next identical URL returns instantly (~5ms)
-    _RESULT_CACHE.set(result_cache_key, response_data, ttl=86400)  # 24h
+    # Only cache the full result when we have a definitive verdict.
+    # If Phishs errored (verdict=-1) AND no other strong signal fired
+    # (GSB/VT/feed), use a short 5-min cache so the next scan retries Phishs.
+    phishs_was_error = (phishs_result.get("verdict", -1) == -1)
+    strong_signal_fired = (
+        gsb_result.get("is_unsafe") or
+        vt_result.get("verdict") == "malicious" or
+        _feed_matched or
+        _phishs_fired  # Phishs or feed set this to True
+    )
+    cache_ttl = 86400 if (not phishs_was_error or strong_signal_fired) else 300
+    _RESULT_CACHE.set(result_cache_key, response_data, ttl=cache_ttl)
+    if cache_ttl == 300:
+        print(f"[CACHE] Short TTL (5min) for {url!r} -- Phishs was inconclusive")
+    # BUGFIX: log using response_data's FINAL values, not the pre-override
+    # local variables `result`/`confidence`. Previously this line ignored
+    # whatever _apply_visual_clone_if_known() had just done — so a fresh scan
+    # that got upgraded to status="visual_clone" (hash matched) was logged to
+    # Scan History as "predicted"/"feed_match" instead, contradicting the
+    # "Visual Clone" badge the user saw in the popup for that same scan.
+    _final_status = response_data.get("status", "predicted")
+    if _final_status not in ("visual_clone",):
+        _final_status = "feed_match" if _feed_matched else "predicted"
+    _log_scan(url,
+              response_data.get("prediction", result),
+              response_data.get("confidence", confidence),
+              _final_status)
     return response_data
 
 
@@ -1799,6 +2881,9 @@ async def quick_predict(request: URLRequest):
             if result == "Phishing"
             else "URL appears safe"
         )
+        # NOTE: /quick does NOT call _log_scan.
+        # It is a fast pre-check called by the extension before /predict.
+        # Only /predict logs to scan history to avoid double-counting.
         return {
             "prediction": result,
             "confidence": confidence,
@@ -1825,8 +2910,103 @@ async def analyze_screenshot(request: ScreenshotRequest):
     if not request.screenshot:
         raise HTTPException(status_code=400, detail="No screenshot provided")
 
-    result = is_visual_clone(request.screenshot)
+    # ── URL-based fast path ───────────────────────────────────────────────────
+    # If this URL's path (scheme+host+path, no query params) already appears in
+    # _URL_TO_HASH it was previously confirmed as a phishing page.  Return a
+    # visual-clone hit immediately WITHOUT relying on screenshot pHash comparison.
+    #
+    # Why this is needed:
+    #   popup.js's captureCleanScreenshot() previously used requestAnimationFrame
+    #   (which fires on the *popup* window's paint cycle, not the tab's).  This
+    #   meant the orange overlay banner could still be pixel-visible in the tab
+    #   when captureVisibleTab fired, baking the banner into the stored pHash.
+    #   background.js always captures a clean page (fresh load, no overlay yet),
+    #   so the pHash distance exceeded PHASH_SIMILARITY_THRESHOLD and
+    #   is_visual_clone() returned False even though the hash WAS in the DB.
+    #
+    #   The timing bug is now fixed in popup.js, but hashes stored before the
+    #   fix may still be "dirty" (overlay baked in).  The URL fast path makes
+    #   detection reliable regardless of screenshot quality.
+    req_cache_key = _cache_key(request.url)            # scheme://host/path only
+    url_fast_hash: Optional[str] = None
+    for stored_url_key, stored_hash in list(_URL_TO_HASH.items()):
+        if _cache_key(stored_url_key) == req_cache_key:
+            url_fast_hash = stored_hash
+            break
+
+    if url_fast_hash is not None:
+        current_hash = compute_screenshot_hash(request.screenshot)
+        print(f"[CLONE-CHECK] URL fast-path HIT for {request.url!r} "
+              f"→ matched stored hash {url_fast_hash}")
+
+        # ── Self-healing: repair dirty stored hashes automatically ────────────
+        # The stored hash may have been captured with popup.js's old buggy code
+        # (requestAnimationFrame timing — orange overlay baked into the PNG).
+        # If the current screenshot's pHash differs from the stored one by more
+        # than the similarity threshold, the stored hash is "dirty".  We add the
+        # current clean hash to KNOWN_PHISHING_HASHES so that subsequent scans
+        # can match via normal pHash comparison without needing the URL fast-path.
+        if (current_hash
+                and current_hash != url_fast_hash
+                and current_hash not in KNOWN_PHISHING_HASHES
+                and _IMAGEHASH_AVAILABLE):
+            try:
+                dist = (imagehash.hex_to_hash(current_hash)
+                        - imagehash.hex_to_hash(url_fast_hash))
+                if dist > PHASH_SIMILARITY_THRESHOLD:
+                    # Stored hash is dirty — register the current clean hash
+                    KNOWN_PHISHING_HASHES.add(current_hash)
+                    if current_hash not in _HASH_INSERT_ORDER:
+                        _HASH_INSERT_ORDER.append(current_hash)
+                    _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH, _HASH_INSERT_ORDER)
+                    print(f"[CLONE-CHECK] Dirty hash detected (dist={dist} > "
+                          f"{PHASH_SIMILARITY_THRESHOLD}). "
+                          f"Registered clean hash {current_hash} — "
+                          f"pHash comparison will work on next scan.")
+            except Exception as _heal_err:
+                print(f"[CLONE-CHECK] Self-healing error: {_heal_err}")
+
+        cached_before    = _RESULT_CACHE.get(_cache_key(request.url))
+        already_phishing = (cached_before is not None
+                            and cached_before.get("prediction") == "Phishing")
+        if not already_phishing:
+            updated = _update_last_scan_for_url(request.url, "Phishing", 0.99, "visual_clone")
+            if not updated:
+                _log_scan(request.url, "Phishing", 0.99, "visual_clone")
+        return {
+            "is_clone":     True,
+            "matched_hash": url_fast_hash,
+            "current_hash": current_hash,
+            "db_size":      len(KNOWN_PHISHING_HASHES),
+            "message":      "Screenshot matches a known phishing page design"
+        }
+
+    # ── pHash image comparison (fallback) ────────────────────────────────────
+    result       = is_visual_clone(request.screenshot)
     current_hash = result.get("current_hash")
+
+    if result["is_clone"]:
+        # Visual clone override: only update scan history when correcting a
+        # non-Phishing verdict (Uncertain → Phishing).
+        #
+        # If the verdict was ALREADY Phishing (cache hit from previous detection):
+        #   - /predict already logged "cached"
+        #   - We must NOT update that to "visual_clone"
+        #   - The popup/overlay still shows Visual Clone because the cached result
+        #     has prediction="Phishing" + visual_clone in reasons
+        #
+        # Since background.js now runs /predict BEFORE /screenshot (sequential),
+        # /predict has always logged by the time we get here — no race condition.
+        cached_before = _RESULT_CACHE.get(_cache_key(request.url))
+        already_phishing = cached_before is not None and cached_before.get("prediction") == "Phishing"
+
+        if not already_phishing:
+            # Genuine correction: Uncertain (or first scan) → Phishing via clone
+            updated = _update_last_scan_for_url(
+                request.url, "Phishing", 0.99, "visual_clone"
+            )
+            if not updated:
+                _log_scan(request.url, "Phishing", 0.99, "visual_clone")
 
     return {
         "is_clone":     result["is_clone"],
@@ -1856,16 +3036,46 @@ async def add_phishing_hash(request: ScreenshotRequest):
     if not h:
         raise HTTPException(status_code=400, detail="Could not compute hash from screenshot")
 
+    print(f"[HASH-DB] /hash/add called for url={request.url!r}  computed_hash={h}")
+
     already_existed = h in KNOWN_PHISHING_HASHES
     KNOWN_PHISHING_HASHES.add(h)
 
-    # Store URL→hash mapping for reliable removal later
-    # (removing by URL lookup is far more reliable than recomputing screenshot hash)
-    url_key = request.url.strip().lower()
+    # Track insertion order — append only if hash is new
+    if not already_existed:
+        _HASH_INSERT_ORDER.append(h)
+
+    # Require a valid URL — reject the request if none is provided.
+    # A hash without a URL mapping would show as "Unknown origin" in the dashboard
+    # and provides no actionable information for the admin. We never store such hashes.
+    if not request.url.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="URL is required when adding a phishing hash. "
+                   "A hash without a source URL cannot be stored."
+        )
+
+    # Store URL→hash mapping — with orphan prevention:
+    # If this URL already maps to a DIFFERENT hash, don't overwrite.
+    # Overwriting causes the old hash to lose its URL mapping → "Unknown origin".
+    # Root cause: background.js re-scans take new screenshots → slightly different
+    # pHash each time. We keep the FIRST hash for each URL (the original detection).
+    url_key       = _normalise_for_lookup(request.url)
+    existing_hash = _URL_TO_HASH.get(url_key)
+    if existing_hash and existing_hash != h:
+        # URL already has a hash — don't create an orphan; return the existing one
+        print(f"[HASH-DB] URL already mapped to {existing_hash} — skipping new hash {h}")
+        return {
+            "added":           existing_hash,
+            "already_existed": True,
+            "db_size":         len(KNOWN_PHISHING_HASHES),
+            "persisted_to":    _HASH_DB_PATH,
+            "message":         f"URL already has hash {existing_hash} — no change made"
+        }
     _URL_TO_HASH[url_key] = h
 
-    # Persist both to disk
-    _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH)
+    # Persist set + order + url map to disk
+    _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH, _HASH_INSERT_ORDER)
 
     return {
         "added":          h,
@@ -1890,7 +3100,14 @@ async def remove_hash_by_url(request: URLRequest):
 
     Called by popup.js and content.js when "Mark as Safe" is clicked.
     """
-    url_key = request.url.strip().lower()
+    # BUGFIX: must use the SAME normalisation as /hash/add (_normalise_for_lookup),
+    # which strips tracking params (utm_source, campaignid, adgroupid, etc.).
+    # Using a different key here means this lookup almost never finds what
+    # /hash/add stored for any URL with tracking params attached (i.e. nearly
+    # every ad-driven page visit) — the hash silently never gets removed, and
+    # subsequent /hash/add calls for the same URL are then blocked by the
+    # orphan-prevention check, which thinks a hash is already mapped.
+    url_key = _normalise_for_lookup(request.url)
     h = _URL_TO_HASH.get(url_key)
 
     if not h:
@@ -1903,7 +3120,10 @@ async def remove_hash_by_url(request: URLRequest):
 
     KNOWN_PHISHING_HASHES.discard(h)
     _URL_TO_HASH.pop(url_key, None)
-    _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH)
+    # Remove from insertion order list
+    try: _HASH_INSERT_ORDER.remove(h)
+    except ValueError: pass
+    _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH, _HASH_INSERT_ORDER)
 
     return {
         "removed":      True,
@@ -1933,11 +3153,12 @@ async def remove_hash_by_screenshot(request: ScreenshotRequest):
                 "message": f"Hash not in database — nothing removed"}
 
     KNOWN_PHISHING_HASHES.discard(h)
-    # Also remove any URL mapping that points to this hash
     for k, v in list(_URL_TO_HASH.items()):
         if v == h:
             _URL_TO_HASH.pop(k, None)
-    _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH)
+    try: _HASH_INSERT_ORDER.remove(h)
+    except ValueError: pass
+    _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH, _HASH_INSERT_ORDER)
 
     return {"removed": True, "hash": h, "db_size": len(KNOWN_PHISHING_HASHES),
             "message": f"Hash {h} removed"}
@@ -1945,11 +3166,26 @@ async def remove_hash_by_screenshot(request: ScreenshotRequest):
 
 @app.get("/hash/list")
 async def list_phishing_hashes():
-    """List all known phishing page hashes currently in the database."""
+    """
+    List all known phishing page hashes currently in the database.
+    Also returns hash_url_map (hash → url) so the admin dashboard can
+    display which site each hash was captured from.
+    """
+    # Invert _URL_TO_HASH (url→hash) to hash→url for easy frontend lookup
+    hash_url_map = {v: k for k, v in _URL_TO_HASH.items()}
+    # Return in reverse insertion order: most recently added hash is first (#1 in UI)
+    ordered_newest_first = list(reversed(_HASH_INSERT_ORDER))
+    # Include any hashes that were added directly (not via /hash/add) and
+    # therefore aren't in _HASH_INSERT_ORDER yet
+    all_hashes_in_order  = ordered_newest_first + [
+        h for h in sorted(KNOWN_PHISHING_HASHES)
+        if h not in set(_HASH_INSERT_ORDER)
+    ]
     return {
-        "db_size":    len(KNOWN_PHISHING_HASHES),
-        "db_path":    _HASH_DB_PATH,
-        "hashes":     sorted(KNOWN_PHISHING_HASHES),
+        "db_size":             len(KNOWN_PHISHING_HASHES),
+        "db_path":             _HASH_DB_PATH,
+        "hashes":              all_hashes_in_order,   # newest first
+        "hash_url_map":        hash_url_map,
         "imagehash_available": _IMAGEHASH_AVAILABLE,
     }
 
@@ -1963,12 +3199,29 @@ async def delete_phishing_hash(hash_str: str):
     """
     if hash_str not in KNOWN_PHISHING_HASHES:
         raise HTTPException(status_code=404, detail=f"Hash {hash_str!r} not found in database")
+
+    # 1. Remove from the hash set (used for pHash comparison at scan time)
     KNOWN_PHISHING_HASHES.discard(hash_str)
-    _save_hash_db(KNOWN_PHISHING_HASHES)
+
+    # 2. Remove from insertion-order list (controls display order in Hash DB tab)
+    try: _HASH_INSERT_ORDER.remove(hash_str)
+    except ValueError: pass
+
+    # 3. Remove every URL→hash mapping whose value IS this hash.
+    #    Without this step the hash string remains visible in phishing_hashes.json
+    #    under "url_hash_map" even after deletion, making it look like it wasn't removed.
+    stale_urls = [url for url, h in list(_URL_TO_HASH.items()) if h == hash_str]
+    for url in stale_urls:
+        _URL_TO_HASH.pop(url, None)
+
+    # 4. Persist — all three data structures are now clean
+    _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH, _HASH_INSERT_ORDER)
+
     return {
-        "deleted":  hash_str,
-        "db_size":  len(KNOWN_PHISHING_HASHES),
-        "message":  f"Hash removed from memory and disk"
+        "deleted":      hash_str,
+        "url_mappings_removed": stale_urls,
+        "db_size":      len(KNOWN_PHISHING_HASHES),
+        "message":      "Hash fully removed from memory, url_map, and disk"
     }
 
 
@@ -1976,15 +3229,28 @@ async def delete_phishing_hash(hash_str: str):
 async def update_cache_entry(request: dict):
     """
     Write a client-side overridden result back to the server cache.
-    Called by background.js and popup.js after visual clone override fires,
-    so all clients (popup, overlay, next scan) see the same consistent result.
+    Called by background.js and popup.js after visual clone override fires.
+
+    Scan history is NOT updated here — the /screenshot endpoint is the single
+    place that handles scan history for visual clone corrections. This endpoint
+    is purely a cache write.
     """
     url    = request.get("url", "").strip()
     result = request.get("result", {})
     if not url or not result:
         raise HTTPException(status_code=400, detail="url and result required")
-    _RESULT_CACHE.set(url.lower(), result, ttl=86400)
-    return {"status": "updated", "url": url, "prediction": result.get("prediction")}
+
+    # Ensure the stored status reflects the clone override
+    reasons = result.get("reasons", [])
+    if any(r.get("feature") == "visual_clone" for r in reasons):
+        result["status"] = "visual_clone"
+
+    _RESULT_CACHE.set(_cache_key(url), result, ttl=86400)
+    return {
+        "status":     "updated",
+        "url":        url,
+        "prediction": result.get("prediction"),
+    }
 
 
 @app.post("/cache/clear")
@@ -2015,6 +3281,22 @@ async def cache_stats():
         "vt_cache":      {"entries": _VT_CACHE.size(),     "ttl_hours": 24},
         "note": "Hit the same URL twice to see result_cache grow by 1."
     }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INTEGRATION
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# PhishGuard proxies every GoPhish API call through FastAPI so:
+#   1. The GoPhish API key never leaves the server
+#   2. React frontend has no CORS issue (same origin as /admin-stats)
+#   3. We can enrich GoPhish data with PhishGuard ML risk scores
+#
+# Configuration — set these in your .env file:
+#   PHISHGUARD_UNUSED = http://localhost:3333   (GoPhish server address)
+#   PHISHGUARD_UNUSED = <your GoPhish API key>  (from GoPhish Settings page)
+#
 
 
 @app.get("/feed-status")
@@ -2058,6 +3340,21 @@ async def whitelist_status():
     }
 
 
+
+@app.get("/static-whitelist")
+async def get_static_whitelist():
+    """
+    Returns the full _STATIC_DOMAINS list as a JSON array.
+    This is the single source of truth for the trusted-domain whitelist.
+    background.js fetches this on service worker startup so the extension
+    always stays in sync with the server — no more maintaining two separate lists.
+    Example: GET http://localhost:8000/static-whitelist
+    """
+    return {
+        "domains": sorted(_STATIC_DOMAINS),
+        "count":   len(_STATIC_DOMAINS),
+    }
+
 @app.get("/")
 async def root():
     return {"message": "Advanced Phishing Detection API ready"}
@@ -2070,6 +3367,8 @@ class ReportRequest(BaseModel):
     url:         str
     report_type: str = "false_positive"   # "false_positive" or "false_negative"
     reported_by: str = "user"
+    screenshot:  str = ""                 # optional base64 PNG — if provided on false_negative,
+                                          # hash is added immediately without a separate /hash/add call
 
 @app.post("/report")
 async def report_url(request: ReportRequest):
@@ -2084,7 +3383,7 @@ async def report_url(request: ReportRequest):
     """
     url         = request.url.strip()
     report_type = request.report_type
-    cache_key   = url.lower().strip()
+    cache_key   = _cache_key(url)   # same key as /predict uses
 
     # Build a corrected cached result based on what the user reported
     if report_type == "false_positive":
@@ -2116,20 +3415,40 @@ async def report_url(request: ReportRequest):
     _RESULT_CACHE.set(cache_key, corrected_result, ttl=86400)
 
     # If marking as safe: also remove the phishing hash for this URL
-    # so visual clone detection doesn't override the correction
+    # Use _normalise_for_lookup so tracking-param variants find the same key.
     if report_type == "false_positive":
-        h = _URL_TO_HASH.pop(url.lower(), None)
+        norm_key = _normalise_for_lookup(url)
+        h = _URL_TO_HASH.pop(norm_key, None)
         if h:
             KNOWN_PHISHING_HASHES.discard(h)
-            _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH)
-            print(f"[REPORT] Hash {h} removed for false_positive on {url!r}")
+            try: _HASH_INSERT_ORDER.remove(h)
+            except ValueError: pass
+            _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH, _HASH_INSERT_ORDER)
+            print(f"[REPORT] Hash {h} removed (false_positive) for {url!r}")
+
+    # If reporting as phishing AND a screenshot was provided, add its hash now.
+    # This makes /report self-contained — popup.js still calls /hash/add separately
+    # (belt-and-suspenders), but the web app can also trigger hash addition
+    # if it ever gains screenshot capability.
+    hash_added = None
+    if report_type == "false_negative" and request.screenshot:
+        h = compute_screenshot_hash(request.screenshot)
+        if h and h not in KNOWN_PHISHING_HASHES:
+            KNOWN_PHISHING_HASHES.add(h)
+            _HASH_INSERT_ORDER.append(h)
+            url_key = _normalise_for_lookup(url)
+            _URL_TO_HASH[url_key] = h
+            _save_hash_db(KNOWN_PHISHING_HASHES, _URL_TO_HASH, _HASH_INSERT_ORDER)
+            hash_added = h
+            print(f"[REPORT] Hash {h} added for false_negative on {url!r}")
 
     entry = {
-        "url":         url,
-        "report_type": report_type,
+        "url":          url,
+        "report_type":  report_type,
         "corrected_to": corrected_prediction,
-        "reported_by": request.reported_by,
-        "timestamp":   dt.datetime.now(dt.timezone.utc).isoformat(),
+        "reported_by":  request.reported_by,
+        "hash_added":   hash_added,
+        "timestamp":    dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     _REPORTS.append(entry)
     print(f"[REPORT] {entry} → cache overwritten for 24h")
@@ -2146,3 +3465,165 @@ async def report_url(request: ReportRequest):
 async def get_reports():
     """View all submitted reports (protect this endpoint in production)."""
     return {"count": len(_REPORTS), "reports": _REPORTS}
+
+
+# ======================================================================
+# === ADMIN DASHBOARD — SCAN HISTORY + AGGREGATED STATS
+# ======================================================================
+
+# In-memory scan event log.
+# deque(maxlen) gives O(1) bounded append — oldest entry auto-evicted.
+# _SCAN_HISTORY_LOCK protects iteration in /admin-stats and /scan-history.
+_MAX_SCAN_HISTORY   = 2000            # keep at most 2,000 entries in RAM
+_SCAN_HISTORY: deque = deque(maxlen=_MAX_SCAN_HISTORY)
+_SCAN_HISTORY_LOCK  = threading.Lock()
+
+
+def _log_scan(url: str, prediction: str, confidence: float, status: str) -> None:
+    """Append one scan event to the bounded thread-safe history log."""
+    entry = {
+        "url":        url,
+        "prediction": prediction,
+        "confidence": round(float(confidence), 4),
+        "status":     status,
+        "timestamp":  dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    with _SCAN_HISTORY_LOCK:
+        _SCAN_HISTORY.append(entry)
+
+
+def _update_last_scan_for_url(url: str, prediction: str, confidence: float, status: str) -> bool:
+    """
+    Find the most recent scan history entry for this URL and update it in-place.
+    Called by the /screenshot endpoint when a visual clone is detected AFTER
+    /predict already logged the pre-override verdict (e.g. "Uncertain").
+
+    Returns True if an existing entry was found and updated, False if not found
+    (in which case the caller should call _log_scan to add a new entry).
+    """
+    key = _cache_key(url)
+    with _SCAN_HISTORY_LOCK:
+        history_list = list(_SCAN_HISTORY)
+        # Scan from most-recent (end) backwards to find the latest entry for this URL
+        for i in range(len(history_list) - 1, -1, -1):
+            if _cache_key(history_list[i]["url"]) == key:
+                history_list[i] = {
+                    **history_list[i],
+                    "prediction": prediction,
+                    "confidence": round(float(confidence), 4),
+                    "status":     status,
+                    # Keep original timestamp; add updated_at to show it was corrected
+                    "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                }
+                # Rebuild the deque from the updated list
+                _SCAN_HISTORY.clear()
+                _SCAN_HISTORY.extend(history_list)
+                return True
+    return False
+
+
+@app.post("/log-trusted")
+async def log_trusted_visit(request: URLRequest):
+    """
+    Called by background.js when a URL is bypassed via the trusted-domain
+    shortcut (isTrustedDomain() returned true) so those visits appear in
+    the admin dashboard Scan History — they were previously invisible because
+    the trusted-domain shortcut never reached the /predict endpoint.
+
+    This is a fire-and-forget call — background.js does not await a response.
+    The endpoint is intentionally lightweight: no ML, no whitelist check,
+    just a log entry.
+    """
+    url = request.url.strip()
+    if url:
+        _log_scan(url, "Legitimate", 1.0, "trusted")
+    return {"logged": True}
+
+
+
+@app.get("/scan-history")
+async def get_scan_history(limit: int = 500):
+    """
+    Return recent scan events in reverse-chronological order.
+    Used by the Admin Dashboard Scan History tab.
+
+    Query param:
+        limit — max entries to return (default 500, max 2,000)
+
+    Example:
+        GET http://localhost:8000/scan-history?limit=100
+    """
+    limit = min(limit, _MAX_SCAN_HISTORY)
+    with _SCAN_HISTORY_LOCK:
+        snapshot = list(_SCAN_HISTORY)
+    recent = list(reversed(snapshot))[:limit]
+    return {
+        "total":   len(snapshot),
+        "count":   len(recent),
+        "history": recent,
+    }
+
+
+@app.get("/admin-stats")
+async def get_admin_stats():
+    """
+    Aggregated statistics for the Admin Dashboard overview card.
+    Combines scan history, cache sizes, feed / whitelist metadata, and reports.
+
+    Example:
+        GET http://localhost:8000/admin-stats
+    """
+    with _SCAN_HISTORY_LOCK:
+        snap = list(_SCAN_HISTORY)
+
+    total     = len(snap)
+    phishing  = sum(1 for s in snap if s["prediction"] == "Phishing")
+    uncertain = sum(1 for s in snap if s["prediction"] == "Uncertain")
+    legit     = sum(1 for s in snap if s["prediction"] == "Legitimate")
+
+    domain_ctr: Counter = Counter()
+    for s in snap:
+        if s["prediction"] == "Phishing":
+            try:
+                domain = urlparse(s["url"]).netloc or s["url"]
+                if domain:
+                    domain_ctr[domain] += 1
+            except Exception:
+                pass
+
+    return {
+        # Scan counts
+        "total_scans":         total,
+        "phishing":            phishing,
+        "uncertain":           uncertain,
+        "legitimate":          legit,
+        "phishing_rate":       round(phishing / total * 100, 1) if total else 0.0,
+
+        # Top flagged domains
+        "top_flagged_domains": domain_ctr.most_common(10),
+
+        # Cache sizes
+        "cache_stats": {
+            "result_cache": _RESULT_CACHE.size(),
+            "whois_cache":  _WHOIS_CACHE.size(),
+            "vt_cache":     _VT_CACHE.size(),
+        },
+
+        # Misc
+        "reports":      len(_REPORTS),
+        "hash_db_size": len(KNOWN_PHISHING_HASHES),
+
+        # External feed / whitelist status
+        "feed_status": _phishing_feed_meta,
+        "whitelist": {
+            "tranco":       _tranco_meta,
+            "static_count": len(_STATIC_DOMAINS),
+        },
+    }
+
+@app.post("/admin/clear-history")
+async def clear_scan_history():
+    """Clear all scan history (for testing/evaluation)."""
+    with _SCAN_HISTORY_LOCK:
+        _SCAN_HISTORY.clear()
+    return {"cleared": True, "message": "Scan history cleared"}
